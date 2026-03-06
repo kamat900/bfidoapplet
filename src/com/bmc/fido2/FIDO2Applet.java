@@ -184,6 +184,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      */
     private boolean pinSet;
     /**
+     * True if biometric (fingerprint) templates are enrolled on the device
+     */
+    private boolean bioEnrolled;
+    /**
      * Minimum number of UTF-8 code points in PIN
      */
     private byte minPinLength = 4;
@@ -5474,6 +5478,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             numResidentRPs = 0;
 
             pinSet = false;
+            bioEnrolled = false;
             if (STORE_PIN_LENGTH) {
                 pinCodePointLength = 0;
             }
@@ -5543,9 +5548,9 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      */
     private void sendAuthInfo(APDU apdu) {
-        byte[] buffer = apdu.getBuffer();
-        boolean longResponse = apdu.getOffsetCdata() == ISO7816.OFFSET_EXT_CDATA;
-
+        // Write entire response to bufferMem, then use doSendResponse which
+        // properly handles APDU block sizing and response chaining.
+        byte[] buffer = bufferMem;
         short offset = 0;
 
         short numOptions = 0x00B0;
@@ -5577,11 +5582,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 buffer, offset, (short) aaguid.length);
 
         buffer[offset++] = 0x04; // map key: options
-        buffer[offset++] = (byte) 0xAB; // map: eleven entries
-        /*buffer[offset++] = 0x62; // string: two bytes long
-        buffer[offset++] = 0x65; // 'e'
-        buffer[offset++] = 0x70; // 'p'
-        buffer[offset++] = (byte)(enterpriseAttestation ? 0xF5 : 0xF4); // enabled or not */
+        buffer[offset++] = (byte) 0xAD; // map: thirteen entries
 
         offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_SECOND, (short) 0,
                 buffer, offset, (short) CannedCBOR.AUTH_INFO_SECOND.length);
@@ -5591,6 +5592,11 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_THIRD, (short) 0,
                 buffer, offset, (short) CannedCBOR.AUTH_INFO_THIRD.length);
 
+        buffer[offset++] = (byte)(bioEnrolled ? 0xF5 : 0xF4); // bioEnroll: true if templates enrolled
+
+        offset = encodeIntLenTo(buffer, offset, (short) CannedCBOR.CLIENT_PIN.length, false);
+        offset = Util.arrayCopyNonAtomic(CannedCBOR.CLIENT_PIN, (short) 0,
+                buffer, offset, (short) CannedCBOR.CLIENT_PIN.length);
         buffer[offset++] = (byte)(pinSet ? 0xF5 : 0xF4); // clientPin
 
         offset = encodeIntLenTo(buffer, offset, (short) CannedCBOR.LARGE_BLOBS.length, false);
@@ -5611,7 +5617,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         offset = encodeIntLenTo(buffer, offset, (short) CannedCBOR.MAKE_CRED_UV_NOT_REQD.length, false);
         offset = Util.arrayCopyNonAtomic(CannedCBOR.MAKE_CRED_UV_NOT_REQD, (short) 0,
                 buffer, offset, (short) CannedCBOR.MAKE_CRED_UV_NOT_REQD.length);
-        buffer[offset++] = (byte)(LOW_SECURITY_MAXIMUM_COMPLIANCE && !alwaysUv ? 0xF5 : 0xF4); // makeCredUvNotRequired = true or false
+        buffer[offset++] = (byte)(LOW_SECURITY_MAXIMUM_COMPLIANCE && !alwaysUv ? 0xF5 : 0xF4); // makeCredUvNotRequired
 
         if (includeMaxMsgSize) {
             buffer[offset++] = 0x05; // map key: maxMsgSize
@@ -5627,63 +5633,34 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         buffer[offset++] = 0x07; // map key: maxCredentialCountInList
         buffer[offset++] = 0x17; // twenty-three
 
-        final short amountInApduBuf = offset;
+        buffer[offset++] = 0x08; // map key: maxCredentialIdLength
+        offset = encodeIntTo(buffer, offset, (byte) CREDENTIAL_ID_LEN);
 
-        final byte approximateKeyCount = getApproximateRemainingKeyCount();
-        boolean partiallySent = false;
-        if (!longResponse) {
-            // We're going to have too much for one 256-byte buffer
-            // So let's split into two halves, one directly APDU-written and one saved
-            buffer = bufferMem;
-            offset = 0;
-        } else if (apdu.getBuffer().length > 300) {
-            // We have an E-APDU, but there's room for our reply in the
-            // APDU outgoing buffer: keep writing
-        } else {
-            // We have an E-APDU, buf there's not room for our response in the outgoing
-            // buffer. Write aside.
-            final short remainingAmountToWrite = (short)(CannedCBOR.ES256_ALG_TYPE.length
-                    + (approximateKeyCount > 23 ? 2 : 1) // encoded length of approxKeyCount
-                    + (minPinLength > 23 ? 2 : 1) // encoded length of minPinLength
-                    + 23 // fixed overhead;
-            );
-            apdu.setOutgoing();
-            apdu.setOutgoingLength((short)(offset + remainingAmountToWrite));
-            apdu.sendBytes((short) 0, offset);
-            // And overwrite the same buffer again
-            offset = 0;
-            partiallySent = true;
-        }
-
-        buffer[offset++] = 0x08; // map key: maxCredentialIdLength: 1 byte
-        offset = encodeIntTo(buffer, offset, (byte) CREDENTIAL_ID_LEN); // 2 bytes = 3
-
-        buffer[offset++] = 0x0A; // map key: algorithms: 1 byte = 4
+        buffer[offset++] = 0x0A; // map key: algorithms
         offset = Util.arrayCopyNonAtomic(CannedCBOR.ES256_ALG_TYPE, (short) 0,
-                buffer, offset, (short) CannedCBOR.ES256_ALG_TYPE.length); // added separately
+                buffer, offset, (short) CannedCBOR.ES256_ALG_TYPE.length);
 
-        buffer[offset++] = 0x0B; // map key: maxSerializedLargeBlobArray: 1 byte = 5
-        buffer[offset++] = 0x19; // two-byte integer: 1 byte = 6
-        offset = Util.setShort(buffer, offset, (short) getCurrentLargeBlobStore().length); // 2 bytes = 8
+        buffer[offset++] = 0x0B; // map key: maxSerializedLargeBlobArray
+        buffer[offset++] = 0x19; // two-byte integer
+        offset = Util.setShort(buffer, offset, (short) getCurrentLargeBlobStore().length);
 
-        buffer[offset++] = 0x0C; // map key: forcePinChange: 1 byte = 9
-        buffer[offset++] = (byte)(forcePinChange ? 0xF5 : 0xF4); // 1 byte = 10
+        buffer[offset++] = 0x0C; // map key: forcePinChange
+        buffer[offset++] = (byte)(forcePinChange ? 0xF5 : 0xF4);
 
-        buffer[offset++] = 0x0D; // map key: minPinLength: 1 byte = 11
-        offset = encodeIntTo(buffer, offset, minPinLength); // encoded separately
+        buffer[offset++] = 0x0D; // map key: minPinLength
+        offset = encodeIntTo(buffer, offset, minPinLength);
 
-        buffer[offset++] = 0x0E; // map key: firmwareVersion: 1 byte = 12
-        offset = encodeIntTo(buffer, offset, FIRMWARE_VERSION); // 1 byte = 13
+        buffer[offset++] = 0x0E; // map key: firmwareVersion
+        offset = encodeIntTo(buffer, offset, FIRMWARE_VERSION);
 
-        buffer[offset++] = 0x0F; // map key: maxCredBlobLength: 1 byte = 14
-        offset = encodeIntTo(buffer, offset, MAX_CRED_BLOB_LEN); // 2 bytes = 16
+        buffer[offset++] = 0x0F; // map key: maxCredBlobLength
+        offset = encodeIntTo(buffer, offset, MAX_CRED_BLOB_LEN);
 
-        buffer[offset++] = 0x10; // map key: maxRPIDsForSetMinPinLength: 1 byte = 17
-        offset = encodeIntTo(buffer, offset, MAX_RP_IDS_MIN_PIN_LENGTH); // 1 byte = 18
+        buffer[offset++] = 0x10; // map key: maxRPIDsForSetMinPinLength
+        offset = encodeIntTo(buffer, offset, MAX_RP_IDS_MIN_PIN_LENGTH);
 
-        buffer[offset++] = 0x12; // map key: uvModality: 1 byte = 19
-        buffer[offset++] = 0x19; // two-byte integer: 1 byte = 20
-        offset = Util.setShort(buffer, offset, (short) 0x0200); // uvModality "none": 2 bytes = 22
+        buffer[offset++] = 0x12; // map key: uvModality
+        buffer[offset++] = 0x02; // USER_VERIFY_FINGERPRINT_INTERNAL (touch sensor)
 
         if (includeCertifications) {
             buffer[offset++] = 0x13; // map key: certifications
@@ -5692,20 +5669,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             buffer[offset++] = CERTIFICATION_LEVEL;
         }
 
-        buffer[offset++] = 0x14; // map key: remainingDiscoverableCredentials: 1 byte = 23
-        offset = encodeIntTo(buffer, offset, approximateKeyCount); // variable
+        buffer[offset++] = 0x14; // map key: remainingDiscoverableCredentials
+        offset = encodeIntTo(buffer, offset, getApproximateRemainingKeyCount());
 
-        if (longResponse) {
-            if (partiallySent) {
-                bufferManager.clear();
-                apdu.sendBytes((short) 0, offset);
-            } else {
-                sendNoCopy(apdu, offset);
-            }
-        } else {
-            sendNoCopy(apdu, amountInApduBuf);
-            setupChainedResponse((short) 0, offset);
-        }
+        doSendResponse(apdu, offset);
     }
 
     /**

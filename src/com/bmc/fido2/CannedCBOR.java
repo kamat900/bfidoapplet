@@ -85,7 +85,10 @@ public abstract class CannedCBOR {
                             (byte) 0xF5, // true
                         0x62, // string: two bytes long
                             0x75, 0x70, // up
-                            (byte) 0xF4, // false
+                            (byte) 0xF5, // true - touch fingerprint sensor provides user presence
+                        0x62, // string: two bytes long
+                            0x75, 0x76, // uv
+                            (byte) 0xF5, // true - device supports built-in user verification (fingerprint)
                         0x66, // string: six bytes long
                             0x75, 0x76, 0x41, 0x63, 0x66, 0x67, // uvAcfg
                             (byte) 0xF5, // true
@@ -97,11 +100,15 @@ public abstract class CannedCBOR {
             0x68, // string - eight bytes long
                 0x63, 0x72, 0x65, 0x64, 0x4d, 0x67, 0x6d, 0x74, // credMgmt
                 (byte) 0xF5, // true
-            0x69, // string: eight bytes long
+            0x69, // string: nine bytes long
                 0x61, 0x75, 0x74, 0x68, 0x6E, 0x72, 0x43, 0x66, 0x67, // authnrCfg
                 (byte) 0xF5, // true
             0x69, // string: nine bytes long
-                0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x50, 0x69, 0x6e, // clientPin
+                0x62, 0x69, 0x6F, 0x45, 0x6E, 0x72, 0x6F, 0x6C, 0x6C, // bioEnroll
+    };
+
+    static final byte[] CLIENT_PIN = {
+            0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x50, 0x69, 0x6e, // clientPin
     };
 
     static final byte[] MAKE_CRED_UV_NOT_REQD = {
