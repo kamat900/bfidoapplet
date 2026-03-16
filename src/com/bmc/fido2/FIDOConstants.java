@@ -11,6 +11,7 @@ public abstract class FIDOConstants {
     public static final byte CMD_CLIENT_PIN = 0x06;
     public static final byte CMD_RESET = 0x07;
     public static final byte CMD_GET_NEXT_ASSERTION = 0x08;
+    public static final byte CMD_BIO_ENROLLMENT = 0x09;
     public static final byte CMD_CREDENTIAL_MANAGEMENT = 0x0A;
     public static final byte CMD_AUTHENTICATOR_SELECTION = 0x0B;
     public static final byte CMD_LARGE_BLOBS = 0x0C;
@@ -45,6 +46,76 @@ public abstract class FIDOConstants {
     public static final byte AUTH_CONFIG_ENABLE_ENTERPRISE_ATTESTATION = 0x01;
     public static final byte AUTH_CONFIG_TOGGLE_ALWAYS_UV = 0x02;
     public static final byte AUTH_CONFIG_SET_MIN_PIN_LENGTH = 0x03;
+
+    // Bio enrollment subcommands
+    public static final byte BIO_ENROLL_BEGIN = 0x01;
+    public static final byte BIO_ENROLL_CAPTURE_NEXT = 0x02;
+    public static final byte BIO_ENROLL_CANCEL = 0x03;
+    public static final byte BIO_ENROLL_ENUMERATE = 0x04;
+    public static final byte BIO_ENROLL_SET_NAME = 0x05;
+    public static final byte BIO_ENROLL_REMOVE = 0x06;
+    public static final byte BIO_ENROLL_GET_SENSOR_INFO = 0x07;
+
+    // Bio enrollment CBOR map keys (request)
+    public static final byte BIO_REQ_MODALITY = 0x01;
+    public static final byte BIO_REQ_SUBCOMMAND = 0x02;
+    public static final byte BIO_REQ_SUB_COMMAND_PARAMS = 0x03;
+    public static final byte BIO_REQ_PIN_UV_AUTH_PROTOCOL = 0x04;
+    public static final byte BIO_REQ_PIN_UV_AUTH_PARAM = 0x05;
+    public static final byte BIO_REQ_GET_MODALITY = 0x06;
+
+    // Bio enrollment CBOR map keys (response)
+    public static final byte BIO_RESP_MODALITY = 0x01;
+    public static final byte BIO_RESP_FINGERPRINT_KIND = 0x02;
+    public static final byte BIO_RESP_MAX_SAMPLES = 0x03;
+    public static final byte BIO_RESP_TEMPLATE_ID = 0x04;
+    public static final byte BIO_RESP_LAST_SAMPLE_STATUS = 0x05;
+    public static final byte BIO_RESP_REMAINING_SAMPLES = 0x06;
+    public static final byte BIO_RESP_TEMPLATE_INFOS = 0x07;
+
+    // Bio enrollment sample status values
+    public static final byte BIO_SAMPLE_GOOD = 0x00;
+    public static final byte BIO_SAMPLE_TOO_HIGH = 0x01;
+    public static final byte BIO_SAMPLE_TOO_LOW = 0x02;
+    public static final byte BIO_SAMPLE_TOO_LEFT = 0x03;
+    public static final byte BIO_SAMPLE_TOO_RIGHT = 0x04;
+    public static final byte BIO_SAMPLE_TOO_FAST = 0x05;
+    public static final byte BIO_SAMPLE_TOO_SLOW = 0x06;
+    public static final byte BIO_SAMPLE_POOR_QUALITY = 0x07;
+    public static final byte BIO_SAMPLE_TOO_SKEWED = 0x08;
+    public static final byte BIO_SAMPLE_TOO_SHORT = 0x09;
+    public static final byte BIO_SAMPLE_MERGE_FAILURE = 0x0A;
+    public static final byte BIO_SAMPLE_EXISTS = 0x0B;
+    public static final byte BIO_SAMPLE_NO_USER_ACTIVITY = 0x0D;
+    public static final byte BIO_SAMPLE_NO_USER_PRESENCE_TRANSITION = 0x0E;
+
+    // Proprietary MCU sensor control: SW to request sensor operation
+    // (returned as APDU status to trigger MCU-side fingerprint operations)
+    public static final short SW_BIO_SENSOR_CONTROL = (short) 0x91F0;
+
+    // Proprietary MCU sensor control: INS byte of result APDU from MCU
+    public static final byte INS_BIO_SENSOR_RESULT = (byte) 0xF1;
+
+    // Sensor control sub-commands (P1 values in sensor control response body)
+    public static final byte SC_BIO_GET_SENSOR_INFO = 0x01;
+    public static final byte SC_BIO_CAPTURE_IMAGE = 0x02;
+    public static final byte SC_BIO_GENERATE_TEMPLATE = 0x03;
+    public static final byte SC_BIO_MATCH_FINGER = 0x04;
+    public static final byte SC_BIO_STORE_TEMPLATE = 0x05;
+    public static final byte SC_BIO_DELETE_TEMPLATE = 0x06;
+    public static final byte SC_BIO_DELETE_ALL = 0x07;
+    public static final byte SC_BIO_GET_TEMPLATE_COUNT = 0x08;
+    public static final byte SC_BIO_SEARCH_FINGER = 0x09;
+    public static final byte SC_BIO_REG_MODEL = 0x0A;
+    public static final byte SC_BIO_LED_CONTROL = 0x0B;
+    public static final byte SC_BIO_GET_ENROLL_IMAGE = 0x0C;
+
+    // Bio enrollment constants
+    public static final byte BIO_MODALITY_FINGERPRINT = 0x01;
+    public static final byte BIO_FINGERPRINT_KIND_TOUCH = 0x01;
+    public static final byte BIO_SAMPLES_REQUIRED = 0x04;
+    public static final byte BIO_MAX_TEMPLATES = 0x05;
+    public static final byte BIO_MAX_FRIENDLY_NAME_LEN = 0x40;  // 64 bytes
 
     // PIN token permissions
     public static final byte PERM_MAKE_CREDENTIAL = 0x01;
@@ -98,6 +169,8 @@ public abstract class FIDOConstants {
     public static final byte CTAP2_ERR_INTEGRITY_FAILURE = 0x3D; // A checksum did not match.
     public static final byte CTAP2_ERR_INVALID_SUBCOMMAND = 0x3E; // The requested subcommand is either invalid or not implemented.
     public static final byte CTAP2_ERR_UNAUTHORIZED_PERMISSION = 0x40; // The permissions parameter contains an unauthorized permission.
+    public static final byte CTAP2_ERR_FP_DATABASE_FULL = 0x41; // Fingerprint database full.
+    public static final byte CTAP2_ERR_NO_FINGERPRINTS = 0x42; // No fingerprints enrolled.
     public static final byte CTAP1_ERR_OTHER = 0x7F; //	 	Other unspecified error.
     /**
      * HKDF "info" for PIN protocol two HMAC key
