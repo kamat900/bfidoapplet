@@ -841,19 +841,19 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         }
 
         if (!pinAuthSuccess) {
-            if (alwaysUv || (pinSet && transientStorage.hasRKOption() && !USE_LOW_SECURITY_FOR_SOME_RKS)) {
-                // Try biometric UV when PIN is not set but biometrics are enrolled
-                if (!pinSet && bioEnrolled && !bioUvVerified) {
-                    bioUvPendingCmd = FIDOConstants.CMD_MAKE_CREDENTIAL;
-                    bioUvPendingLc = lc;
-                    startBioUvVerification(apdu);
-                    // ISOException thrown — never reached
-                }
-                if (bioUvVerified) {
-                    // Biometric UV succeeded — treat as valid UV
-                    pinAuthSuccess = true;
-                    bioUvVerified = false;
-                } else if (pinSet) {
+            // Try biometric UV when fingerprints are enrolled (regardless of alwaysUv/pinSet)
+            if (bioEnrolled && !bioUvVerified) {
+                bioUvPendingCmd = FIDOConstants.CMD_MAKE_CREDENTIAL;
+                bioUvPendingLc = lc;
+                startBioUvVerification(apdu);
+                // ISOException thrown — never reached
+            }
+            if (bioUvVerified) {
+                // Biometric UV succeeded — treat as valid UV
+                pinAuthSuccess = true;
+                bioUvVerified = false;
+            } else if (alwaysUv || (pinSet && transientStorage.hasRKOption() && !USE_LOW_SECURITY_FOR_SOME_RKS)) {
+                if (pinSet) {
                     sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_REQUIRED);
                 } else {
                     sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_NOT_SET);
@@ -2148,21 +2148,19 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             byte pinProtocol = transientStorage.getPinProtocolInUse();
 
             if (!pinProvided) {
-                if (alwaysUv) {
-                    // Try biometric UV when PIN is not set but biometrics are enrolled
-                    if (!pinSet && bioEnrolled && !bioUvVerified) {
-                        bioUvPendingCmd = FIDOConstants.CMD_GET_ASSERTION;
-                        bioUvPendingLc = lc;
-                        startBioUvVerification(apdu);
-                        // ISOException thrown — never reached
-                    }
-                    if (bioUvVerified) {
-                        // Biometric UV succeeded — set UV flag
-                        stateKeepingBuffer[(short)(stateKeepingIdx + 1)] |= 0x01;
-                        bioUvVerified = false;
-                    } else {
-                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_REQUIRED);
-                    }
+                // Try biometric UV when fingerprints are enrolled (regardless of alwaysUv)
+                if (bioEnrolled && !bioUvVerified) {
+                    bioUvPendingCmd = FIDOConstants.CMD_GET_ASSERTION;
+                    bioUvPendingLc = lc;
+                    startBioUvVerification(apdu);
+                    // ISOException thrown — never reached
+                }
+                if (bioUvVerified) {
+                    // Biometric UV succeeded — set UV flag
+                    stateKeepingBuffer[(short)(stateKeepingIdx + 1)] |= 0x01;
+                    bioUvVerified = false;
+                } else if (alwaysUv) {
+                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_REQUIRED);
                 }
             } else {
                 if (buffer[pinAuthIdx] == 0x40) {
@@ -4455,6 +4453,9 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     private static final byte BIO_PHASE_UV_GENCHAR     = 8;
     private static final byte BIO_PHASE_UV_SEARCH      = 9;
 
+    // Sensor validation phase (verify templates exist in sensor on getInfo)
+    private static final byte BIO_PHASE_CHECK_ENROLLED = 10;
+
     /**
      * Biometric UV verification state.
      * When makeCredential/getAssertion needs UV and bioEnrolled is true,
@@ -4938,6 +4939,20 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                     bioUvPendingCmd = 0;
                     sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
                 }
+                return;
+
+            case BIO_PHASE_CHECK_ENROLLED:
+                // Result of GetTemplateCount — verify sensor has enrolled templates
+                // bioEnrollPhase stays as CHECK_ENROLLED to prevent re-entry in sendAuthInfo
+                if (sensorSW == (short) 0x9000 && dataLen >= 1) {
+                    byte templateCount = apduBytes[apdu.getOffsetCdata()];
+                    bioEnrolled = (templateCount > 0);
+                } else {
+                    // Sensor error — mark as not enrolled
+                    bioEnrolled = false;
+                }
+                // Re-call sendAuthInfo; phase is still CHECK_ENROLLED so sensor check won't re-trigger
+                sendAuthInfo(apdu);
                 return;
 
             default:
@@ -6234,6 +6249,20 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      */
     private void sendAuthInfo(APDU apdu) {
+        // Verify sensor actually has enrolled templates before reporting bioEnrolled
+        if (bioEnrolled && bioEnrollPhase == BIO_PHASE_IDLE) {
+            bioEnrollPhase = BIO_PHASE_CHECK_ENROLLED;
+            byte[] apduBuf = apdu.getBuffer();
+            apduBuf[0] = FIDOConstants.SC_BIO_GET_TEMPLATE_COUNT;
+            apduBuf[1] = 0x00;
+            apdu.setOutgoing();
+            apdu.setOutgoingLength((short) 2);
+            apdu.sendBytes((short) 0, (short) 2);
+            ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
+        }
+        // Reset phase after sensor check completes (or if check was not needed)
+        bioEnrollPhase = BIO_PHASE_IDLE;
+
         // Write entire response to bufferMem, then use doSendResponse which
         // properly handles APDU block sizing and response chaining.
         byte[] buffer = bufferMem;
