@@ -110,6 +110,10 @@ public abstract class FIDOConstants {
     public static final byte SC_BIO_LED_CONTROL = 0x0B;
     public static final byte SC_BIO_GET_ENROLL_IMAGE = 0x0C;
 
+    // Bio enrollment subCommandParams map keys (also used in templateInfos entries per CTAP2.1 spec)
+    public static final byte BIO_SUBCMD_PARAM_TEMPLATE_ID = 0x01;
+    public static final byte BIO_SUBCMD_PARAM_FRIENDLY_NAME = 0x02;
+
     // Bio enrollment constants
     public static final byte BIO_MODALITY_FINGERPRINT = 0x01;
     public static final byte BIO_FINGERPRINT_KIND_TOUCH = 0x01;

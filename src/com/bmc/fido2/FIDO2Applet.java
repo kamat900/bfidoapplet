@@ -4429,6 +4429,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     private byte bioEnrollSampleIndex;
     private short bioEnrollPageId;
     private byte[] bioEnrollTemplateId;
+
+    // Bio template persistent storage (mirrors bio_template_name_t in firmware ctap_bio_enrollment.c)
+    private byte[] bioTemplateFriendlyName;
+    private short bioTemplateFriendlyNameLen;
     /**
      * Enrollment phase tracking for multi-round-trip sensor control.
      * 0 = idle
@@ -4480,6 +4484,8 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         bioUvPendingCmd = 0;
         bioUvPendingLc = 0;
         bioEnrolled = false;
+        bioTemplateFriendlyName = new byte[FIDOConstants.BIO_MAX_FRIENDLY_NAME_LEN];
+        bioTemplateFriendlyNameLen = 0;
     }
 
     /**
@@ -4637,9 +4643,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 bioEnumerateEnrollments(apdu);
                 break;
             case FIDOConstants.BIO_ENROLL_SET_NAME:
-                // friendlyName setting - not stored on card, acknowledge success
-                bufferMem[0] = FIDOConstants.CTAP2_OK;
-                doSendResponse(apdu, (short) 1);
+                bioSetFriendlyName(apdu, reqBuffer, subCmdParamsIdx, subCmdParamsLen, lc);
                 break;
             case FIDOConstants.BIO_ENROLL_REMOVE:
                 bioRemoveEnrollment(apdu, reqBuffer, subCmdParamsIdx, subCmdParamsLen);
@@ -4866,6 +4870,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 bioEnrollPhase = BIO_PHASE_IDLE;
                 if (sensorSW == (short) 0x9000) {
                     bioEnrolled = false;
+                    bioTemplateFriendlyNameLen = 0;
                 }
                 // Return success regardless (template may not have existed)
                 bufferMem[0] = FIDOConstants.CTAP2_OK;
@@ -5025,14 +5030,115 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             buffer[offset++] = (byte) 0x80; // array(0)
         } else {
             buffer[offset++] = (byte) 0x81; // array(1) — single slot
-            buffer[offset++] = (byte) 0xA1; // map(1) - templateInfo
-            buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_ID;
+
+            // templateInfo map: templateId + optional friendlyName
+            boolean hasName = bioTemplateFriendlyNameLen > 0;
+            byte mapSize = (byte)(hasName ? 2 : 1);
+            buffer[offset++] = (byte)(0xA0 | mapSize);
+
+            // templateId (subCommandParams key 0x01 per CTAP2.1 spec §6.7)
+            buffer[offset++] = FIDOConstants.BIO_SUBCMD_PARAM_TEMPLATE_ID;
             buffer[offset++] = (byte)(0x40 | 2); // bstr(2)
             buffer[offset++] = (byte)(bioEnrollPageId >> 8);
             buffer[offset++] = (byte)(bioEnrollPageId & 0xFF);
+
+            // templateFriendlyName (subCommandParams key 0x02, optional)
+            if (hasName) {
+                buffer[offset++] = FIDOConstants.BIO_SUBCMD_PARAM_FRIENDLY_NAME;
+                if (bioTemplateFriendlyNameLen <= 23) {
+                    buffer[offset++] = (byte)(0x60 | bioTemplateFriendlyNameLen); // tstr(n)
+                } else {
+                    buffer[offset++] = 0x78; // tstr, 1-byte length follows
+                    buffer[offset++] = (byte) bioTemplateFriendlyNameLen;
+                }
+                Util.arrayCopy(bioTemplateFriendlyName, (short) 0, buffer, offset, bioTemplateFriendlyNameLen);
+                offset += bioTemplateFriendlyNameLen;
+            }
         }
 
         doSendResponse(apdu, offset);
+    }
+
+    /**
+     * Store friendly name for an enrolled fingerprint template.
+     * Parses subCommandParams CBOR map to extract templateId and templateFriendlyName,
+     * then persists the name (similar to bio_set_friendly_name in firmware ctap_bio_enrollment.c).
+     */
+    private void bioSetFriendlyName(APDU apdu, byte[] reqBuffer, short paramsIdx, short paramsLen, short lc) {
+        if (paramsIdx < 0 || paramsLen <= 0) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
+            return;
+        }
+        if (!bioEnrolled) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_NO_FINGERPRINTS);
+            return;
+        }
+
+        // Parse subCommandParams CBOR map
+        short readIdx = paramsIdx;
+        short endIdx = (short)(paramsIdx + paramsLen);
+
+        byte mapCount = (byte) getMapEntryCount(apdu, reqBuffer[readIdx]);
+        readIdx++;
+
+        short nameIdx = -1;
+        short nameLen = 0;
+        boolean hasTemplateId = false;
+
+        for (short i = 0; i < mapCount && readIdx < endIdx; i++) {
+            byte key = reqBuffer[readIdx++];
+
+            switch (key) {
+                case FIDOConstants.BIO_SUBCMD_PARAM_TEMPLATE_ID: // 0x01
+                    hasTemplateId = true;
+                    readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
+                    break;
+                case FIDOConstants.BIO_SUBCMD_PARAM_FRIENDLY_NAME: { // 0x02
+                    // Parse CBOR text string (major type 3)
+                    short s = ub(reqBuffer[readIdx]);
+                    if (s >= 0x0060 && s <= 0x0077) {
+                        // Short text string: length 0-23
+                        nameLen = (short)(s - 0x0060);
+                        readIdx++;
+                        nameIdx = readIdx;
+                        readIdx += nameLen;
+                    } else if (s == 0x0078) {
+                        // Text string with 1-byte length
+                        readIdx++;
+                        nameLen = ub(reqBuffer[readIdx]);
+                        readIdx++;
+                        nameIdx = readIdx;
+                        readIdx += nameLen;
+                    } else {
+                        // Unsupported encoding or byte string — skip
+                        readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
+                    }
+                    break;
+                }
+                default:
+                    readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
+                    break;
+            }
+        }
+
+        if (!hasTemplateId) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
+            return;
+        }
+
+        if (nameIdx >= 0 && nameLen > 0 && nameLen <= FIDOConstants.BIO_MAX_FRIENDLY_NAME_LEN) {
+            Util.arrayCopy(reqBuffer, nameIdx, bioTemplateFriendlyName, (short) 0, nameLen);
+            bioTemplateFriendlyNameLen = nameLen;
+        } else if (nameLen == 0) {
+            // Empty name clears the friendly name
+            bioTemplateFriendlyNameLen = 0;
+        } else {
+            sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_INVALID_PARAMETER);
+            return;
+        }
+
+        bufferMem[0] = FIDOConstants.CTAP2_OK;
+        doSendResponse(apdu, (short) 1);
     }
 
     /**
@@ -6175,6 +6281,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             pinSet = false;
             bioEnrolled = false;
             bioEnrollPageId = 10;
+            bioTemplateFriendlyNameLen = 0;
             if (STORE_PIN_LENGTH) {
                 pinCodePointLength = 0;
             }
