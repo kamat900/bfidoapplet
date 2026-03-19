@@ -4474,11 +4474,12 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         bioEnrollActive = false;
         bioEnrollSamplesRemaining = 0;
         bioEnrollSampleIndex = 0;
-        bioEnrollPageId = 10; // Fixed page ID for FIDO2
+        bioEnrollPageId = 10; // Fixed page ID for single-slot enrollment
         bioEnrollPhase = BIO_PHASE_IDLE;
         bioUvVerified = false;
         bioUvPendingCmd = 0;
         bioUvPendingLc = 0;
+        bioEnrolled = false;
     }
 
     /**
@@ -4707,9 +4708,14 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * This process repeats until the applet returns a final SW=0x9000 response.
      */
     private void bioEnrollBeginWithSensor(APDU apdu) {
-        // Cancel any previous session
+        // Single-slot: if already enrolled, must remove first
+        if (bioEnrolled) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_KEY_STORE_FULL);
+            return;
+        }
+        // Start enrollment session with fixed page ID
         bioEnrollActive = true;
-        bioEnrollPageId = 10; // Fixed page ID
+        bioEnrollPageId = 10;
         bioEnrollTemplateId[0] = (byte)(bioEnrollPageId >> 8);
         bioEnrollTemplateId[1] = (byte)(bioEnrollPageId & 0xFF);
         bioEnrollSamplesRemaining = FIDOConstants.BIO_SAMPLES_REQUIRED;
@@ -4922,8 +4928,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                     bioUvPendingCmd = 0;
                     bioUvPendingLc = 0;
 
-                    // Clear bufferManager for clean re-entry
+                    // Clear bufferManager and re-initialize APDU buffer for clean re-entry
                     bufferManager.clear();
+                    bufferManager.initializeAPDU(apdu);
+                    bufferManager.informAPDUBufferAvailability(apdu, (short) 0xFF);
 
                     // Re-dispatch the pending command from saved bufferMem data
                     if (pendingCmd == FIDOConstants.CMD_MAKE_CREDENTIAL) {
@@ -4939,20 +4947,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                     bioUvPendingCmd = 0;
                     sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
                 }
-                return;
-
-            case BIO_PHASE_CHECK_ENROLLED:
-                // Result of GetTemplateCount — verify sensor has enrolled templates
-                // bioEnrollPhase stays as CHECK_ENROLLED to prevent re-entry in sendAuthInfo
-                if (sensorSW == (short) 0x9000 && dataLen >= 1) {
-                    byte templateCount = apduBytes[apdu.getOffsetCdata()];
-                    bioEnrolled = (templateCount > 0);
-                } else {
-                    // Sensor error — mark as not enrolled
-                    bioEnrolled = false;
-                }
-                // Re-call sendAuthInfo; phase is still CHECK_ENROLLED so sensor check won't re-trigger
-                sendAuthInfo(apdu);
                 return;
 
             default:
@@ -5017,26 +5011,20 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     }
 
     /**
-     * Enumerate enrolled fingerprints by querying MCU sensor.
-     * Uses the GetTemplateCount sensor command.
+     * Enumerate enrolled fingerprints from persistent store.
      */
     private void bioEnumerateEnrollments(APDU apdu) {
-        // For simplicity, report based on bioEnrolled flag
         byte[] buffer = bufferMem;
         short offset = 0;
 
         buffer[offset++] = FIDOConstants.CTAP2_OK;
+        buffer[offset++] = (byte) 0xA1; // map(1)
+        buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_INFOS;
 
         if (!bioEnrolled) {
-            // Empty response
-            buffer[offset++] = (byte) 0xA1; // map(1)
-            buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_INFOS;
             buffer[offset++] = (byte) 0x80; // array(0)
         } else {
-            // One template enrolled at fixed page ID
-            buffer[offset++] = (byte) 0xA1; // map(1)
-            buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_INFOS;
-            buffer[offset++] = (byte) 0x81; // array(1)
+            buffer[offset++] = (byte) 0x81; // array(1) — single slot
             buffer[offset++] = (byte) 0xA1; // map(1) - templateInfo
             buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_ID;
             buffer[offset++] = (byte)(0x40 | 2); // bstr(2)
@@ -5051,9 +5039,15 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * Remove enrolled fingerprint by sending delete command to MCU sensor.
      */
     private void bioRemoveEnrollment(APDU apdu, byte[] reqBuffer, short paramsIdx, short paramsLen) {
+        if (!bioEnrolled) {
+            // Nothing to remove
+            bufferMem[0] = FIDOConstants.CTAP2_OK;
+            doSendResponse(apdu, (short) 1);
+            return;
+        }
+
         bioEnrollPhase = BIO_PHASE_DELETE;
 
-        // Request: delete template at the fixed page ID
         byte[] apduBuf = apdu.getBuffer();
         apduBuf[0] = FIDOConstants.SC_BIO_DELETE_TEMPLATE;
         apduBuf[1] = 0x00;
@@ -6180,6 +6174,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
             pinSet = false;
             bioEnrolled = false;
+            bioEnrollPageId = 10;
             if (STORE_PIN_LENGTH) {
                 pinCodePointLength = 0;
             }
@@ -6249,19 +6244,8 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      */
     private void sendAuthInfo(APDU apdu) {
-        // Verify sensor actually has enrolled templates before reporting bioEnrolled
-        if (bioEnrolled && bioEnrollPhase == BIO_PHASE_IDLE) {
-            bioEnrollPhase = BIO_PHASE_CHECK_ENROLLED;
-            byte[] apduBuf = apdu.getBuffer();
-            apduBuf[0] = FIDOConstants.SC_BIO_GET_TEMPLATE_COUNT;
-            apduBuf[1] = 0x00;
-            apdu.setOutgoing();
-            apdu.setOutgoingLength((short) 2);
-            apdu.sendBytes((short) 0, (short) 2);
-            ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-        }
-        // Reset phase after sensor check completes (or if check was not needed)
-        bioEnrollPhase = BIO_PHASE_IDLE;
+        // bioEnrolled is now maintained by persistent enrollment store
+        // No sensor probe needed — trust addBioEnrollment/removeBioEnrollment
 
         // Write entire response to bufferMem, then use doSendResponse which
         // properly handles APDU block sizing and response chaining.

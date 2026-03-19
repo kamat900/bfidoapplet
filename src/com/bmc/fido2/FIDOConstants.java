@@ -114,7 +114,7 @@ public abstract class FIDOConstants {
     public static final byte BIO_MODALITY_FINGERPRINT = 0x01;
     public static final byte BIO_FINGERPRINT_KIND_TOUCH = 0x01;
     public static final byte BIO_SAMPLES_REQUIRED = 0x04;
-    public static final byte BIO_MAX_TEMPLATES = 0x05;
+    public static final byte BIO_MAX_TEMPLATES = 0x01;
     public static final byte BIO_MAX_FRIENDLY_NAME_LEN = 0x40;  // 64 bytes
 
     // PIN token permissions
