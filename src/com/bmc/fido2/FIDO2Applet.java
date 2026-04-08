@@ -4471,6 +4471,14 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     private short bioUvPendingLc;
 
     /**
+     * Flag indicating that a reset command is pending after bio sensor
+     * deletion completes. When authenticatorReset() finds bioEnrolled==true,
+     * it sends a sensor delete command and sets this flag. After the sensor
+     * responds, handleBioSensorResult() re-dispatches the reset.
+     */
+    private boolean resetPendingAfterBioDelete;
+
+    /**
      * Initialize bio enrollment resources (call from install)
      */
     private void initBioEnrollment() {
@@ -4872,7 +4880,18 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                     bioEnrolled = false;
                     bioTemplateFriendlyNameLen = 0;
                 }
-                // Return success regardless (template may not have existed)
+
+                // If this deletion was triggered by authenticatorReset(),
+                // re-dispatch the reset command now that sensor cleanup is done.
+                if (resetPendingAfterBioDelete) {
+                    // bioEnrolled is now false (or sensor failed, proceed anyway)
+                    // Re-enter authenticatorReset which will skip the sensor
+                    // deletion branch and proceed with the main reset transaction.
+                    authenticatorReset(apdu);
+                    return;
+                }
+
+                // Normal (non-reset) deletion: return success
                 bufferMem[0] = FIDOConstants.CTAP2_OK;
                 doSendResponse(apdu, (short) 1);
                 break;
@@ -6237,6 +6256,31 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
             }
         }
+
+        // If a fingerprint is enrolled, physically delete it from the sensor
+        // before proceeding with the reset transaction. The sensor control
+        // protocol (SW=0x91F0) interrupts APDU flow, so this must happen
+        // outside the JCSystem transaction below.
+        if (bioEnrolled && !resetPendingAfterBioDelete) {
+            resetPendingAfterBioDelete = true;
+            bioEnrollPhase = BIO_PHASE_DELETE;
+
+            byte[] apduBuf = apdu.getBuffer();
+            apduBuf[0] = FIDOConstants.SC_BIO_DELETE_TEMPLATE;
+            apduBuf[1] = 0x00;
+            // Data: [start_page_hi] [start_page_lo] [count_hi] [count_lo]
+            apduBuf[2] = (byte)(bioEnrollPageId >> 8);
+            apduBuf[3] = (byte)(bioEnrollPageId & 0xFF);
+            apduBuf[4] = 0x00;
+            apduBuf[5] = 0x01; // count = 1
+            apdu.setOutgoing();
+            apdu.setOutgoingLength((short) 6);
+            apdu.sendBytes((short) 0, (short) 6);
+            ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
+            return; // unreachable, but makes intent clear
+        }
+        // Clear the flag in case we re-entered after sensor deletion
+        resetPendingAfterBioDelete = false;
 
         final short pinIdx = pinRetryCounter.prepareIndex();
         final byte tempBlobStoreIndex = (byte)(largeBlobStoreIndex == 0 ? 1 : 0);
