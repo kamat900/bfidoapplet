@@ -4460,6 +4460,11 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     // Sensor validation phase (verify templates exist in sensor on getInfo)
     private static final byte BIO_PHASE_CHECK_ENROLLED = 10;
 
+    // Added by MP: clear any stale sensor template (page 10) at the start of a fresh enrollment,
+    // so re-installing the applet (which wipes bioEnrolled) doesn't collide with a template still
+    // physically stored in the sensor's own flash. Result advances to BIO_PHASE_CAPTURE.
+    private static final byte BIO_PHASE_ENROLL_PREDELETE = 11;
+
     /**
      * Biometric UV verification state.
      * When makeCredential/getAssertion needs UV and bioEnrolled is true,
@@ -4636,10 +4641,39 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         checkPinProtocolSupported(apdu, pinProtocol);
 
-        // Verify PIN auth over: modality || subCommand || subCommandParams
-        // For simplicity, verify over the raw CBOR content following the cmd byte
-        // (This matches the CTAP2.1 spec for bioEnrollment pinUvAuthParam verification)
-        // TODO: implement full pinUvAuth verification over serialized message
+        // Added by MP: actually verify pinUvAuthParam (previously only its presence was required).
+        // Per CTAP2.1, the token must carry the "be" (bioEnrollment) permission, and pinUvAuthParam
+        // must authenticate the message: modality || subCommand || subCommandParams.
+        if ((transientStorage.getPinPermissions() & FIDOConstants.PERM_BIO_ENROLLMENT) == 0x00) {
+            // Token lacks the bioEnrollment permission
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+
+        // Locate the raw pinUvAuthParam bytes, skipping the CBOR byte-string header
+        short pinAuthDataIdx;
+        if (reqBuffer[pinAuthIdx] == 0x58) { // one-byte length form (e.g. protocol 2: 0x58 0x20 ..)
+            pinAuthDataIdx = (short)(pinAuthIdx + 2);
+        } else { // in-place length form 0x4X (e.g. protocol 1: 0x50 ..)
+            pinAuthDataIdx = (short)(pinAuthIdx + 1);
+        }
+
+        // Assemble the verification message into scratch: modality || subCommand || subCommandParams
+        final short bioMsgLen = (short)(2 + (subCmdParamsIdx == -1 ? 0 : subCmdParamsLen));
+        final short bioMsgHandle = bufferManager.allocate(apdu, bioMsgLen, BufferManager.ANYWHERE);
+        final short bioMsgOff = bufferManager.getOffsetForHandle(bioMsgHandle);
+        final byte[] bioMsgBuf = bufferManager.getBufferForHandle(apdu, bioMsgHandle);
+        bioMsgBuf[bioMsgOff] = modality;
+        bioMsgBuf[(short)(bioMsgOff + 1)] = subCommand;
+        if (subCmdParamsIdx != -1 && subCmdParamsLen > 0) {
+            Util.arrayCopyNonAtomic(reqBuffer, subCmdParamsIdx,
+                    bioMsgBuf, (short)(bioMsgOff + 2), subCmdParamsLen);
+        }
+
+        // Verify. Do NOT invalidate the token: a single enrollment spans enrollBegin + repeated
+        // enrollCaptureNext commands, all sharing the same token.
+        checkPinToken(apdu, bioMsgBuf, bioMsgOff, bioMsgLen,
+                reqBuffer, pinAuthDataIdx, pinProtocol, false);
+        bufferManager.release(apdu, bioMsgHandle, bioMsgLen);
 
         // Dispatch sub-command
         switch (subCommand) {
@@ -4740,15 +4774,23 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         bioEnrollTemplateId[1] = (byte)(bioEnrollPageId & 0xFF);
         bioEnrollSamplesRemaining = FIDOConstants.BIO_SAMPLES_REQUIRED;
         bioEnrollSampleIndex = 1;
-        bioEnrollPhase = BIO_PHASE_CAPTURE;
 
-        // Request: GetEnrollImage from MCU sensor
+        // Added by MP: pre-delete the (single) sensor slot before capturing, so a stale template
+        // left in the sensor from a previous applet installation cannot trigger a false duplicate
+        // during SEARCH_DUP. Enrolling into the single slot is an overwrite by design. The delete
+        // result is ignored (the slot may already be empty) — see BIO_PHASE_ENROLL_PREDELETE.
+        bioEnrollPhase = BIO_PHASE_ENROLL_PREDELETE;
         byte[] apduBuf = apdu.getBuffer();
-        apduBuf[0] = FIDOConstants.SC_BIO_GET_ENROLL_IMAGE;
+        apduBuf[0] = FIDOConstants.SC_BIO_DELETE_TEMPLATE;
         apduBuf[1] = 0x00;
+        // Data: [start_page_hi] [start_page_lo] [count_hi] [count_lo]
+        apduBuf[2] = (byte)(bioEnrollPageId >> 8);
+        apduBuf[3] = (byte)(bioEnrollPageId & 0xFF);
+        apduBuf[4] = 0x00;
+        apduBuf[5] = 0x01;
         apdu.setOutgoing();
-        apdu.setOutgoingLength((short) 2);
-        apdu.sendBytes((short) 0, (short) 2);
+        apdu.setOutgoingLength((short) 6);
+        apdu.sendBytes((short) 0, (short) 6);
         ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
     }
 
@@ -4775,6 +4817,18 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         short dataLen = apdu.getIncomingLength();
 
         switch (bioEnrollPhase) {
+
+            case BIO_PHASE_ENROLL_PREDELETE:
+                // Added by MP: result of the pre-enrollment slot clear. Ignore the status (the slot
+                // may legitimately have been empty) and proceed to capture the first sample.
+                bioEnrollPhase = BIO_PHASE_CAPTURE;
+                apduBytes[0] = FIDOConstants.SC_BIO_GET_ENROLL_IMAGE;
+                apduBytes[1] = 0x00;
+                apdu.setOutgoing();
+                apdu.setOutgoingLength((short) 2);
+                apdu.sendBytes((short) 0, (short) 2);
+                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
+                break;
 
             case BIO_PHASE_CAPTURE:
                 // Result of GetEnrollImage
@@ -7741,6 +7795,13 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         // Other stuff
         permissionsRpId[0] = 0x00;
+
+        // Added by MP: clear any stale biometric-UV verification state between card sessions.
+        // The multi-round-trip fingerprint flow always completes within a single session, so this
+        // only ever discards leftover state and never interrupts an in-progress verification.
+        bioUvVerified = false;
+        bioUvPendingCmd = 0;
+        bioUvPendingLc = 0;
     }
 
     /**
