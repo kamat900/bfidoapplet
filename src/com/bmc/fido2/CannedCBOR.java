@@ -79,6 +79,9 @@ public abstract class CannedCBOR {
                     0x50, // byte string, 16 bytes long
     };
 
+    // Added by MP: split so the "uv" option value can be written dynamically
+    // (true only when a fingerprint template is actually enrolled, per CTAP2.1).
+    // The uv boolean byte is emitted by sendAuthInfo() between AUTH_INFO_SECOND and AUTH_INFO_SECOND_B.
     static final byte[] AUTH_INFO_SECOND = {
                         0x62, // string: two bytes long
                             0x72, 0x6B, // rk
@@ -87,8 +90,10 @@ public abstract class CannedCBOR {
                             0x75, 0x70, // up
                             (byte) 0xF5, // true - touch fingerprint sensor provides user presence
                         0x62, // string: two bytes long
-                            0x75, 0x76, // uv
-                            (byte) 0xF5, // true - device supports built-in user verification (fingerprint)
+                            0x75, 0x76, // uv (value written dynamically by sendAuthInfo)
+    };
+    // Added by MP: remainder of the options block that follows the dynamic "uv" value
+    static final byte[] AUTH_INFO_SECOND_B = {
                         0x66, // string: six bytes long
                             0x75, 0x76, 0x41, 0x63, 0x66, 0x67, // uvAcfg
                             (byte) 0xF5, // true

@@ -31,6 +31,8 @@ public abstract class FIDOConstants {
     public static final byte CLIENT_PIN_CHANGE_PIN = 0x04;
     public static final byte CLIENT_PIN_GET_PIN_TOKEN = 0x05;
     public static final byte CLIENT_PIN_GET_PIN_TOKEN_USING_UV_WITH_PERMISSIONS = 0x06;
+    // Added by MP: getUVRetries subcommand (CTAP2.1 §authenticatorClientPIN)
+    public static final byte CLIENT_PIN_GET_UV_RETRIES = 0x07;
     public static final byte CLIENT_PIN_GET_PIN_TOKEN_USING_PIN_WITH_PERMISSIONS = 0x09;
 
     // Credential management subcommands
@@ -170,8 +172,10 @@ public abstract class FIDOConstants {
     public static final byte CTAP2_ERR_REQUEST_TOO_LARGE = 0x39; //	 	Authenticator cannot handle this request due to memory constraints.
     public static final byte CTAP2_ERR_ACTION_TIMEOUT = 0x3A; //	 	The current operation has timed out.
     public static final byte CTAP2_ERR_UP_REQUIRED = 0x3B; //	 	User presence is required for the requested operation.
+    public static final byte CTAP2_ERR_UV_BLOCKED = 0x3C; // Added by MP: built-in user verification is blocked (too many failures this power cycle).
     public static final byte CTAP2_ERR_INTEGRITY_FAILURE = 0x3D; // A checksum did not match.
     public static final byte CTAP2_ERR_INVALID_SUBCOMMAND = 0x3E; // The requested subcommand is either invalid or not implemented.
+    public static final byte CTAP2_ERR_UV_INVALID = 0x3F; // Added by MP: built-in user verification (fingerprint) failed to match.
     public static final byte CTAP2_ERR_UNAUTHORIZED_PERMISSION = 0x40; // The permissions parameter contains an unauthorized permission.
     public static final byte CTAP2_ERR_FP_DATABASE_FULL = 0x41; // Fingerprint database full.
     public static final byte CTAP2_ERR_NO_FINGERPRINTS = 0x42; // No fingerprints enrolled.

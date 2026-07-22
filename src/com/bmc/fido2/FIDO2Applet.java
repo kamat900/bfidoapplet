@@ -4470,6 +4470,12 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     private byte bioUvPendingCmd;
     private short bioUvPendingLc;
 
+    // Added by MP: built-in UV (fingerprint) retry tracking for the standards-compliant
+    // getPinUvAuthTokenUsingUvWithPermissions / getUVRetries flow. Transient (CLEAR_ON_RESET):
+    // failures reset to zero on power cycle, matching CTAP2.1 uvRetries semantics.
+    private static final byte BIO_UV_MAX_RETRIES = 5;
+    private byte[] bioUvFailCount;
+
     /**
      * Flag indicating that a reset command is pending after bio sensor
      * deletion completes. When authenticatorReset() finds bioEnrolled==true,
@@ -4494,6 +4500,8 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         bioEnrolled = false;
         bioTemplateFriendlyName = new byte[FIDOConstants.BIO_MAX_FRIENDLY_NAME_LEN];
         bioTemplateFriendlyNameLen = 0;
+        // Added by MP: transient UV failure counter (resets on power cycle)
+        bioUvFailCount = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
     }
 
     /**
@@ -4947,6 +4955,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                     && apduBytes[apdu.getOffsetCdata()] == 0x01) {
                     // Fingerprint matched — UV verified!
                     bioUvVerified = true;
+                    bioUvFailCount[0] = 0; // Added by MP: reset UV retry counter on success
                     byte pendingCmd = bioUvPendingCmd;
                     short pendingLc = bioUvPendingLc;
                     bioUvPendingCmd = 0;
@@ -4962,14 +4971,31 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                         makeCredential(apdu, pendingLc, bufferMem);
                     } else if (pendingCmd == FIDOConstants.CMD_GET_ASSERTION) {
                         getAssertion(apdu, pendingLc, bufferMem, (short) 0);
+                    } else if (pendingCmd == FIDOConstants.CMD_CLIENT_PIN) {
+                        // Added by MP: re-dispatch getPinUvAuthTokenUsingUvWithPermissions
+                        clientPINSubcommand(apdu, bufferMem, pendingLc);
                     } else {
                         bioUvVerified = false;
                         sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_OTHER);
                     }
                 } else {
                     // No match — UV verification failed
+                    byte failedCmd = bioUvPendingCmd; // Added by MP
                     bioUvPendingCmd = 0;
-                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
+                    if (failedCmd == FIDOConstants.CMD_CLIENT_PIN) {
+                        // Added by MP: standard UV token flow — track retries and report UV errors
+                        if (bioUvFailCount[0] < BIO_UV_MAX_RETRIES) {
+                            bioUvFailCount[0]++;
+                        }
+                        if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
+                            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
+                        } else {
+                            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_INVALID);
+                        }
+                    } else {
+                        // Existing ad-hoc UV path (makeCredential/getAssertion): unchanged behavior
+                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
+                    }
                 }
                 return;
 
@@ -6437,6 +6463,14 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_SECOND, (short) 0,
                 buffer, offset, (short) CannedCBOR.AUTH_INFO_SECOND.length);
 
+        // Added by MP: report uv=true only when a fingerprint template is enrolled (configured),
+        // uv=false when the sensor is present but not configured. This lets platforms (e.g. Windows)
+        // correctly fall back to PIN instead of attempting built-in UV that cannot succeed.
+        buffer[offset++] = (byte)(bioEnrolled ? 0xF5 : 0xF4); // uv
+
+        offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_SECOND_B, (short) 0,
+                buffer, offset, (short) CannedCBOR.AUTH_INFO_SECOND_B.length);
+
         buffer[offset++] = (byte)(alwaysUv ? 0xF5 : 0xF4); // alwaysUv
 
         offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_THIRD, (short) 0,
@@ -6618,12 +6652,166 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 handleClientPinGetToken(apdu, buffer, readIdx, lc, pinProtocol, true, numOptions);
                 return;
             case FIDOConstants.CLIENT_PIN_GET_PIN_TOKEN_USING_UV_WITH_PERMISSIONS:
-                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_NOT_ALLOWED);
-                break;
+                // Added by MP: standards-compliant built-in UV (fingerprint) token acquisition
+                handleClientPinGetTokenUsingUv(apdu, buffer, readIdx, lc, pinProtocol, numOptions);
+                return;
+            case FIDOConstants.CLIENT_PIN_GET_UV_RETRIES:
+                // Added by MP: report remaining built-in UV attempts
+                handleClientPinGetUvRetries(apdu);
+                return;
             default:
                 sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_SUBCOMMAND);
                 break;
         }
+    }
+
+    /**
+     * Added by MP: Handles clientPIN subCommand 0x06 (getPinUvAuthTokenUsingUvWithPermissions).
+     *
+     * Standards-compliant built-in user verification: the platform obtains a pinUvAuthToken by
+     * proving presence of an enrolled fingerprint instead of entering the PIN. This is the flow
+     * modern platforms (Windows 11 WebAuthn, browsers) use for internal-UV authenticators.
+     *
+     * Since the fingerprint capture is a multi-round-trip sensor exchange, this runs in two phases,
+     * reusing the existing bio-UV pending/re-dispatch machinery:
+     *   Phase 1 (bioUvVerified == false): validate preconditions and start fingerprint verification.
+     *            The key agreement is deliberately NOT consumed here, because consumeKeyAgreement()
+     *            mangles the request buffer; leaving it intact lets bufferMem survive the sensor
+     *            round-trips so the command can be re-dispatched.
+     *   Phase 2 (bioUvVerified == true): fingerprint matched — derive the shared secret, apply the
+     *            requested permissions/rpId, and return the encrypted pinUvAuthToken.
+     *
+     * @param apdu        Request/response object
+     * @param buffer      Buffer containing incoming request (bufferMem)
+     * @param readIdx     Read index positioned just after the subCommand value
+     * @param lc          Length of incoming request, as sent by the platform
+     * @param pinProtocol Integer PIN protocol version in use
+     * @param numOptions  Number of CBOR map entries in the request
+     */
+    private void handleClientPinGetTokenUsingUv(APDU apdu, byte[] buffer, short readIdx, short lc,
+                                                byte pinProtocol, short numOptions) {
+        if (!bioEnrolled) {
+            // Built-in UV is not configured — platform should have used the PIN instead
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
+        }
+        if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
+        }
+
+        if (!bioUvVerified) {
+            // Phase 1: kick off fingerprint verification (leaves the request buffer untouched)
+            bioUvPendingCmd = FIDOConstants.CMD_CLIENT_PIN;
+            bioUvPendingLc = lc;
+            startBioUvVerification(apdu);
+            // ISOException thrown by startBioUvVerification — never reached
+            return;
+        }
+
+        // Phase 2: fingerprint already matched (re-dispatched from handleBioSensorResult)
+        bioUvVerified = false; // consume the one-shot verification flag
+
+        if (buffer[readIdx++] != 0x03) { // map key: keyAgreement
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
+        }
+        readIdx = consumeKeyAgreement(apdu, buffer, readIdx, pinProtocol, lc);
+
+        // permissions (map key 0x09) — required for the ...WithPermissions variant
+        if (readIdx >= lc || buffer[readIdx++] != 0x09) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
+        }
+        byte permissions;
+        if (buffer[readIdx] == 0x18) { // one-byte unsigned integer follows
+            permissions = buffer[++readIdx];
+            readIdx++;
+        } else if (ub(buffer[readIdx]) < 0x18) { // in-place small unsigned integer
+            permissions = buffer[readIdx++];
+        } else {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
+            return;
+        }
+        if (permissions == 0) {
+            // FIDO spec disallows an empty permissions bitfield
+            sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_INVALID_PARAMETER);
+        }
+
+        // optional rpId (map key 0x0A)
+        short permRpIdLen = -1;
+        final short permRpIdHandle = bufferManager.allocate(apdu, RP_HASH_LEN, BufferManager.ANYWHERE);
+        final short permRpIdOffset = bufferManager.getOffsetForHandle(permRpIdHandle);
+        final byte[] permRpIdBuffer = bufferManager.getBufferForHandle(apdu, permRpIdHandle);
+
+        if (readIdx < lc && buffer[readIdx] == 0x0A) {
+            readIdx++;
+            if (buffer[readIdx] >= 0x60 && buffer[readIdx] <= 0x77) {
+                // text string with embedded length
+                permRpIdLen = (short)(buffer[readIdx++] - 0x60);
+            } else if (buffer[readIdx] == 0x78) {
+                // text string with one-byte length
+                permRpIdLen = ub(buffer[++readIdx]);
+                readIdx++;
+            } else {
+                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
+            }
+            if (permRpIdLen <= 0) {
+                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
+            }
+            if ((short)(readIdx + permRpIdLen) > lc) {
+                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
+            }
+            sha256.doFinal(buffer, readIdx, permRpIdLen, permRpIdBuffer, permRpIdOffset);
+            readIdx += permRpIdLen;
+        }
+
+        // makeCredential/getAssertion permissions must be bound to a specific RP ID
+        if (permRpIdLen == -1
+                && ((permissions & FIDOConstants.PERM_MAKE_CREDENTIAL) != 0
+                 || (permissions & FIDOConstants.PERM_GET_ASSERTION) != 0)) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
+        }
+
+        // Apply the RP ID binding to the token
+        if (permRpIdLen != -1) {
+            permissionsRpId[0] = 0x01; // RP ID restriction enabled
+            Util.arrayCopyNonAtomic(permRpIdBuffer, permRpIdOffset,
+                    permissionsRpId, (short) 1, RP_HASH_LEN);
+        } else {
+            permissionsRpId[0] = 0x00;
+        }
+        bufferManager.release(apdu, permRpIdHandle, RP_HASH_LEN);
+
+        // Associate the (per-boot) pinUvAuthToken with the granted permissions
+        transientStorage.setPinProtocolInUse(pinProtocol, permissions);
+
+        // Output: { 0x02: pinUvAuthToken }, encrypted with the platform-authenticator shared secret
+        short writeOffset = 0;
+        final byte[] outBuffer = apdu.getBuffer();
+        outBuffer[writeOffset++] = FIDOConstants.CTAP2_OK;
+        outBuffer[writeOffset++] = (byte) 0xA1; // map: one item
+        outBuffer[writeOffset++] = 0x02; // map key: pinUvAuthToken
+        writeOffset = sharedSecretEncrypt(pinToken, (short) 0, (short) pinToken.length,
+                outBuffer, writeOffset, pinProtocol, true);
+        sendNoCopy(apdu, writeOffset);
+    }
+
+    /**
+     * Added by MP: Handles clientPIN subCommand 0x07 (getUVRetries).
+     * Reports how many built-in UV (fingerprint) attempts remain before UV is blocked
+     * until the next power cycle.
+     *
+     * @param apdu Request/response object
+     */
+    private void handleClientPinGetUvRetries(APDU apdu) {
+        byte[] outBuf = apdu.getBuffer();
+        short outputLen = 0;
+        outBuf[outputLen++] = FIDOConstants.CTAP2_OK;
+        outBuf[outputLen++] = (byte) 0xA1; // map - one entry
+        outBuf[outputLen++] = 0x05; // map key: uvRetries
+        short remaining = (short)(BIO_UV_MAX_RETRIES - bioUvFailCount[0]);
+        if (remaining < 0) {
+            remaining = 0;
+        }
+        outBuf[outputLen++] = (byte) remaining;
+        sendNoCopy(apdu, outputLen);
     }
 
     /**
