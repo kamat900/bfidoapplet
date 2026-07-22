@@ -852,6 +852,13 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 // Biometric UV succeeded — treat as valid UV
                 pinAuthSuccess = true;
                 bioUvVerified = false;
+                // Added by MP: biometric UV is a per-request gesture, not an rpId-scoped PIN/UV token.
+                // Clear any leftover token rpId binding so the permissionsRpId check below re-binds to
+                // THIS request's RP. Without this, a stale binding from a prior
+                // getPinUvAuthTokenUsingUvWithPermissions call (e.g. a Chrome fingerprint login to a
+                // different site) makes a bare makeCredential — such as default `pamu2fcfg` — fail with
+                // CTAP2_ERR_PIN_AUTH_INVALID even though the fingerprint matched.
+                permissionsRpId[0] = 0x00;
             } else if (alwaysUv || (pinSet && transientStorage.hasRKOption() && !USE_LOW_SECURITY_FOR_SOME_RKS)) {
                 if (pinSet) {
                     sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_REQUIRED);
