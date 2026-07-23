@@ -178,15 +178,15 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     /**
      * Request/response buffer
      */
-    private byte[] bufferMem;
+    byte[] bufferMem; // Added by MP: package-private for BioManager
     /**
      * True if the device has been locked with a PIN; false in initial boot state before PIN set
      */
     private boolean pinSet;
     /**
-     * True if biometric (fingerprint) templates are enrolled on the device
+     * Added by MP: biometric (fingerprint) subsystem - owns all bio state and the MCU sensor protocol
      */
-    private boolean bioEnrolled;
+    private BioManager bioManager;
     /**
      * Minimum number of UTF-8 code points in PIN
      */
@@ -362,11 +362,11 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     /**
      * Everything that needs to be hot in RAM instead of stored to the flash. All goes away on deselect or reset!
      */
-    private final TransientStorage transientStorage;
+    final TransientStorage transientStorage; // Added by MP: package-private for BioManager
     /**
      * Same, but for managed buffers
      */
-    private BufferManager bufferManager;
+    BufferManager bufferManager; // Added by MP: package-private for BioManager
 
     /**
      * Resident Keys
@@ -428,7 +428,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      * @param len  Length of content to send
      */
-    private void sendNoCopy(APDU apdu, short len) {
+    void sendNoCopy(APDU apdu, short len) {
         bufferManager.clear();
         apdu.setOutgoingAndSend((short) 0, len);
     }
@@ -440,7 +440,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      * @param sendByte Byte representing the CTAP error state
      */
-    private void sendErrorByte(APDU apdu, byte sendByte) {
+    void sendErrorByte(APDU apdu, byte sendByte) {
         transientStorage.clearIterationPointers();
         bufferManager.clear(); // Just in case
 
@@ -535,7 +535,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      *
      * @return The number of map entries in the given CBOR object
      */
-    private short getMapEntryCount(APDU apdu, byte cborMapDeclaration) {
+    short getMapEntryCount(APDU apdu, byte cborMapDeclaration) {
         short sb = ub(cborMapDeclaration);
         if (sb < 0x00A0 || sb > 0x00B7) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
@@ -550,7 +550,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param lc     Length of the request, as sent by the platform
      * @param buffer Byte buffer containing input request
      */
-    private void makeCredential(APDU apdu, short lc, byte[] buffer) {
+    void makeCredential(APDU apdu, short lc, byte[] buffer) {
         short readIdx = 1;
 
         if (lc == 0) {
@@ -842,22 +842,15 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         if (!pinAuthSuccess) {
             // Try biometric UV when fingerprints are enrolled (regardless of alwaysUv/pinSet)
-            if (bioEnrolled && !bioUvVerified) {
-                // Added by MP: enforce the UV retry limit on this ad-hoc path too. Without this, only the
-                // standards token path (clientPIN 0x06) was rate-limited, leaving fingerprint matching here
-                // open to unlimited attempts. Returning UV_BLOCKED tells the client to fall back to the PIN.
-                if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
-                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
-                }
-                bioUvPendingCmd = FIDOConstants.CMD_MAKE_CREDENTIAL;
-                bioUvPendingLc = lc;
-                startBioUvVerification(apdu);
-                // ISOException thrown — never reached
+            if (bioManager.isEnrolled() && !bioManager.isUvVerified()) {
+                // Added by MP: startUvFor enforces the UV retry limit on this ad-hoc path too, then throws
+                // SW_BIO_SENSOR_CONTROL so the MCU reads the finger and this command is re-dispatched.
+                bioManager.startUvFor(apdu, FIDOConstants.CMD_MAKE_CREDENTIAL, lc);
+                // never reached
             }
-            if (bioUvVerified) {
+            if (bioManager.consumeUvVerified()) {
                 // Biometric UV succeeded — treat as valid UV
                 pinAuthSuccess = true;
-                bioUvVerified = false;
                 // Added by MP: biometric UV is a per-request gesture, not an rpId-scoped PIN/UV token.
                 // Clear any leftover token rpId binding so the permissionsRpId check below re-binds to
                 // THIS request's RP. Without this, a stale binding from a prior
@@ -1432,7 +1425,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param pinProtocol     Integer PIN protocol version number
      * @param invalidateToken If true, consider invalidating the PIN token
      */
-    private void checkPinToken(APDU apdu, byte[] content, short contentIdx, short contentLen,
+    void checkPinToken(APDU apdu, byte[] content, short contentIdx, short contentLen,
                                byte[] checkAgainst, short checkIdx, byte pinProtocol,
                                boolean invalidateToken) {
         if (pinProtocol != transientStorage.getPinProtocolInUse()) {
@@ -1931,7 +1924,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param buffer Buffer containing input request
      * @param firstCredIdx The first credential to consider in resident key storage
      */
-    private void getAssertion(final APDU apdu, final short lc, final byte[] buffer,
+    void getAssertion(final APDU apdu, final short lc, final byte[] buffer,
                               final short firstCredIdx) {
         short readIdx = 1;
 
@@ -2167,20 +2160,14 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 // must not prompt for presence/verification. Triggering fingerprint there caused an
                 // extra sensor round-trip that desynced the bio state machine and made the following
                 // real (token-bearing) getAssertion fail with 0x7F.
-                if (bioEnrolled && !bioUvVerified && transientStorage.hasUPOption()) {
-                    // Added by MP: enforce the UV retry limit on this ad-hoc path too (see makeCredential).
-                    if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
-                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
-                    }
-                    bioUvPendingCmd = FIDOConstants.CMD_GET_ASSERTION;
-                    bioUvPendingLc = lc;
-                    startBioUvVerification(apdu);
-                    // ISOException thrown — never reached
+                if (bioManager.isEnrolled() && !bioManager.isUvVerified() && transientStorage.hasUPOption()) {
+                    // Added by MP: startUvFor enforces the UV retry limit (see makeCredential).
+                    bioManager.startUvFor(apdu, FIDOConstants.CMD_GET_ASSERTION, lc);
+                    // never reached
                 }
-                if (bioUvVerified) {
+                if (bioManager.consumeUvVerified()) {
                     // Biometric UV succeeded — set UV flag
                     stateKeepingBuffer[(short)(stateKeepingIdx + 1)] |= 0x01;
-                    bioUvVerified = false;
                 } else if (alwaysUv) {
                     sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_REQUIRED);
                 }
@@ -2587,7 +2574,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      * @param pinProtocol Integer PIN protocol version number
      */
-    private void checkPinProtocolSupported(APDU apdu, byte pinProtocol) {
+    void checkPinProtocolSupported(APDU apdu, byte pinProtocol) {
         if (pinProtocol != 1 && pinProtocol != 2) {
             sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_INVALID_PARAMETER);
         }
@@ -3085,7 +3072,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      * @param outputLen Length of the output buffer, in bytes. Output always starts at index zero
      */
-    private void doSendResponse(APDU apdu, short outputLen) {
+    void doSendResponse(APDU apdu, short outputLen) {
         bufferManager.clear();
 
         final boolean x5c = transientStorage.shouldStreamX5CLater();
@@ -3166,7 +3153,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      *
      * @return Short integer, always positive, representing the byte as unsigned
      */
-    private static short ub(byte b) {
+    static short ub(byte b) {
         return (short)(0xFF & b);
     }
 
@@ -3181,7 +3168,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      *
      * @return New index into incoming request buffer after consuming one CBOR object of any type
      */
-    private short consumeAnyEntity(APDU apdu, byte[] buffer, short readIdx, short lc) {
+    short consumeAnyEntity(APDU apdu, byte[] buffer, short readIdx, short lc) {
         if (readIdx >= lc || readIdx < 0) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
         }
@@ -3624,7 +3611,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         if (apduBytes[ISO7816.OFFSET_CLA] == (byte) 0x80
             && apduBytes[ISO7816.OFFSET_INS] == FIDOConstants.INS_BIO_SENSOR_RESULT) {
             // MCU has completed a sensor operation and sent the result back
-            handleBioSensorResult(apdu);
+            bioManager.handleSensorResult(apdu);
             return;
         }
 
@@ -3709,7 +3696,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             case FIDOConstants.CMD_BIO_ENROLLMENT:
                 reqBuffer = fullyReadReq(apdu, lc, amtRead, true);
 
-                bioEnrollmentSubcommand(apdu, reqBuffer, lcEffective);
+                bioManager.handleEnrollmentCommand(apdu, reqBuffer, lcEffective);
                 break;
             case FIDOConstants.CMD_CREDENTIAL_MANAGEMENT: // intentional fallthrough, for backwards compat
             case FIDOConstants.CMD_CREDENTIAL_MANAGEMENT_PREVIEW:
@@ -4433,18 +4420,9 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         bufferManager.clear();
 
-        // Added by MP: reset biometric state on every applet SELECT.
-        // These fields are persistent (EEPROM), so a power loss ("tear") in the middle of a fingerprint
-        // flow would otherwise leave them stale. Most importantly bioUvVerified could survive as `true`
-        // and make the NEXT makeCredential/getAssertion skip the fingerprint entirely — a UV bypass.
-        // A tear is always followed by a power-up + SELECT, so clearing here closes that window.
-        // Safe for in-progress work: the multi-round 0x91F0 sensor loop never re-SELECTs mid-flow, and a
-        // multi-command enrollment only spans commands within one already-selected session.
-        bioUvVerified = false;
-        bioUvPendingCmd = 0;
-        bioUvPendingLc = 0;
-        bioEnrollPhase = BIO_PHASE_IDLE;
-        bioEnrollActive = false;
+        // Added by MP: reset biometric state on every applet SELECT, so a power loss ("tear") mid-flow
+        // cannot leave stale fingerprint state behind (see BioManager.resetTransientState).
+        bioManager.resetTransientState();
 
         // For U2F compatibility, the CTAP2 standard requires that we respond to select() as if we were a U2F
         // authenticator, and then let the platform figure out we're really CTAP2 by making a getAuthenticatorInfo
@@ -4457,874 +4435,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  Bio Enrollment – Sensor control helper
-    // ─────────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────────
-    //  Bio Enrollment – Main command handler
-    // ─────────────────────────────────────────────────────────────
-
-    // Enrollment session state
-    private boolean bioEnrollActive;
-    private byte bioEnrollSamplesRemaining;
-    private byte bioEnrollSampleIndex;
-    private short bioEnrollPageId;
-    private byte[] bioEnrollTemplateId;
-
-    // Bio template persistent storage (mirrors bio_template_name_t in firmware ctap_bio_enrollment.c)
-    private byte[] bioTemplateFriendlyName;
-    private short bioTemplateFriendlyNameLen;
-    /**
-     * Enrollment phase tracking for multi-round-trip sensor control.
-     * 0 = idle
-     * 1 = waiting for GetEnrollImage result (capture)
-     * 2 = waiting for GenChar result (template generation)
-     * 3 = waiting for Search result (duplicate check)
-     * 4 = waiting for RegModel result (merge templates)
-     * 5 = waiting for StoreChar result (save to sensor flash)
-     * 6 = waiting for DeleteChar result (remove enrollment)
-     */
-    private byte bioEnrollPhase;
-    private static final byte BIO_PHASE_IDLE           = 0;
-    private static final byte BIO_PHASE_CAPTURE        = 1;
-    private static final byte BIO_PHASE_GENCHAR        = 2;
-    private static final byte BIO_PHASE_SEARCH_DUP     = 3;
-    private static final byte BIO_PHASE_REGMODEL       = 4;
-    private static final byte BIO_PHASE_STORE          = 5;
-    private static final byte BIO_PHASE_DELETE         = 6;
-
-    // UV verification phases (biometric user verification for makeCredential/getAssertion)
-    private static final byte BIO_PHASE_UV_CAPTURE     = 7;
-    private static final byte BIO_PHASE_UV_GENCHAR     = 8;
-    private static final byte BIO_PHASE_UV_SEARCH      = 9;
-
-    // Sensor validation phase (verify templates exist in sensor on getInfo)
-    private static final byte BIO_PHASE_CHECK_ENROLLED = 10;
-
-    // Added by MP: clear any stale sensor template (page 10) at the start of a fresh enrollment,
-    // so re-installing the applet (which wipes bioEnrolled) doesn't collide with a template still
-    // physically stored in the sensor's own flash. Result advances to BIO_PHASE_CAPTURE.
-    private static final byte BIO_PHASE_ENROLL_PREDELETE = 11;
-
-    /**
-     * Biometric UV verification state.
-     * When makeCredential/getAssertion needs UV and bioEnrolled is true,
-     * the applet drives a fingerprint verification flow via sensor control.
-     * After successful verification, the pending command is re-executed.
-     */
-    private boolean bioUvVerified;
-    private byte bioUvPendingCmd;
-    private short bioUvPendingLc;
-
-    // Added by MP: built-in UV (fingerprint) retry tracking for the standards-compliant
-    // getPinUvAuthTokenUsingUvWithPermissions / getUVRetries flow. Transient (CLEAR_ON_RESET):
-    // failures reset to zero on power cycle, matching CTAP2.1 uvRetries semantics.
-    private static final byte BIO_UV_MAX_RETRIES = 5;
-    private byte[] bioUvFailCount;
-
-    /**
-     * Flag indicating that a reset command is pending after bio sensor
-     * deletion completes. When authenticatorReset() finds bioEnrolled==true,
-     * it sends a sensor delete command and sets this flag. After the sensor
-     * responds, handleBioSensorResult() re-dispatches the reset.
-     */
-    private boolean resetPendingAfterBioDelete;
-
-    /**
-     * Initialize bio enrollment resources (call from install)
-     */
-    private void initBioEnrollment() {
-        bioEnrollTemplateId = new byte[2];
-        bioEnrollActive = false;
-        bioEnrollSamplesRemaining = 0;
-        bioEnrollSampleIndex = 0;
-        bioEnrollPageId = 10; // Fixed page ID for single-slot enrollment
-        bioEnrollPhase = BIO_PHASE_IDLE;
-        bioUvVerified = false;
-        bioUvPendingCmd = 0;
-        bioUvPendingLc = 0;
-        bioEnrolled = false;
-        bioTemplateFriendlyName = new byte[FIDOConstants.BIO_MAX_FRIENDLY_NAME_LEN];
-        bioTemplateFriendlyNameLen = 0;
-        // Added by MP: transient UV failure counter (resets on power cycle)
-        bioUvFailCount = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
-    }
-
-    /**
-     * Start biometric UV verification via sensor control protocol.
-     * Saves the pending command state and requests a fingerprint capture
-     * from the MCU sensor. The multi-round-trip flow continues in
-     * handleBioSensorResult() through phases UV_CAPTURE → UV_GENCHAR → UV_SEARCH.
-     *
-     * On success, handleBioSensorResult re-dispatches the pending command
-     * with bioUvVerified=true, so makeCredential/getAssertion proceeds with UV flag set.
-     *
-     * @param apdu Request/response object
-     */
-    private void startBioUvVerification(APDU apdu) {
-        bioEnrollPhase = BIO_PHASE_UV_CAPTURE;
-        byte[] apduBuf = apdu.getBuffer();
-        apduBuf[0] = FIDOConstants.SC_BIO_CAPTURE_IMAGE;
-        apduBuf[1] = 0x00;
-        apdu.setOutgoing();
-        apdu.setOutgoingLength((short) 2);
-        apdu.sendBytes((short) 0, (short) 2);
-        ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-    }
-
-    /**
-     * Handles authenticatorBioEnrollment (0x09) CTAP2.1 command.
-     *
-     * The applet maintains CTAP2 protocol state (PIN token verification,
-     * enrollment session) while delegating physical fingerprint sensor
-     * operations to the MCU via proprietary APDUs.
-     *
-     * @param apdu      Request/response object
-     * @param reqBuffer Buffer containing incoming request
-     * @param lc        Length of incoming request
-     */
-    private void bioEnrollmentSubcommand(APDU apdu, byte[] reqBuffer, short lc) {
-        short readIdx = (short) 1; // Skip cmd byte
-
-        if (lc < 2) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
-            return;
-        }
-
-        byte mapEntryCount = (byte)getMapEntryCount(apdu, reqBuffer[readIdx]);
-        readIdx++;
-
-        // Parse request parameters
-        byte subCommand = 0;
-        boolean hasSubCommand = false;
-        boolean hasModality = false;
-        byte modality = 0;
-        boolean getModality = false;
-        byte pinProtocol = 0;
-        boolean hasPinProtocol = false;
-        short pinAuthIdx = -1;
-        short pinAuthLen = 0;
-        short subCmdParamsIdx = -1;
-        short subCmdParamsLen = 0;
-
-        for (short i = 0; i < mapEntryCount; i++) {
-            if (readIdx >= lc) {
-                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
-                return;
-            }
-
-            byte key = reqBuffer[readIdx++];
-
-            switch (key) {
-                case FIDOConstants.BIO_REQ_MODALITY: // 0x01 modality
-                    modality = reqBuffer[readIdx++];
-                    hasModality = true;
-                    break;
-                case FIDOConstants.BIO_REQ_SUBCOMMAND: // 0x02 subCommand
-                    subCommand = reqBuffer[readIdx++];
-                    hasSubCommand = true;
-                    break;
-                case FIDOConstants.BIO_REQ_SUB_COMMAND_PARAMS: // 0x03 subCommandParams
-                    // Store offset and skip CBOR data
-                    subCmdParamsIdx = readIdx;
-                    readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                    subCmdParamsLen = (short)(readIdx - subCmdParamsIdx);
-                    break;
-                case FIDOConstants.BIO_REQ_PIN_UV_AUTH_PROTOCOL: // 0x04 pinUvAuthProtocol
-                    pinProtocol = reqBuffer[readIdx++];
-                    hasPinProtocol = true;
-                    break;
-                case FIDOConstants.BIO_REQ_PIN_UV_AUTH_PARAM: // 0x05 pinUvAuthParam
-                    if ((reqBuffer[readIdx] & 0xE0) == 0x40 || (reqBuffer[readIdx] & 0xE0) == 0x50) {
-                        // Byte string
-                        pinAuthIdx = readIdx;
-                        readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                        pinAuthLen = (short)(readIdx - pinAuthIdx);
-                    } else {
-                        readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                    }
-                    break;
-                case FIDOConstants.BIO_REQ_GET_MODALITY: // 0x06 getModality
-                    if (reqBuffer[readIdx] == (byte) 0xF5) { // CBOR true
-                        getModality = true;
-                    }
-                    readIdx++;
-                    break;
-                default:
-                    // Skip unknown keys
-                    readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                    break;
-            }
-        }
-
-        // Handle getModality (no PIN auth required)
-        if (getModality) {
-            bioSendModalityResponse(apdu);
-            return;
-        }
-
-        if (!hasSubCommand) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
-            return;
-        }
-
-        // getFingerprintSensorInfo: no PIN auth required
-        if (subCommand == FIDOConstants.BIO_ENROLL_GET_SENSOR_INFO) {
-            bioSendSensorInfoResponse(apdu);
-            return;
-        }
-
-        // All other subcommands require pinUvAuth with be permission
-        if (!hasPinProtocol || pinAuthIdx < 0) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_AUTH_INVALID);
-            return;
-        }
-
-        checkPinProtocolSupported(apdu, pinProtocol);
-
-        // Added by MP: actually verify pinUvAuthParam (previously only its presence was required).
-        // Per CTAP2.1, the token must carry the "be" (bioEnrollment) permission, and pinUvAuthParam
-        // must authenticate the message: modality || subCommand || subCommandParams.
-        if ((transientStorage.getPinPermissions() & FIDOConstants.PERM_BIO_ENROLLMENT) == 0x00) {
-            // Token lacks the bioEnrollment permission
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_AUTH_INVALID);
-        }
-
-        // Locate the raw pinUvAuthParam bytes, skipping the CBOR byte-string header
-        short pinAuthDataIdx;
-        if (reqBuffer[pinAuthIdx] == 0x58) { // one-byte length form (e.g. protocol 2: 0x58 0x20 ..)
-            pinAuthDataIdx = (short)(pinAuthIdx + 2);
-        } else { // in-place length form 0x4X (e.g. protocol 1: 0x50 ..)
-            pinAuthDataIdx = (short)(pinAuthIdx + 1);
-        }
-
-        // Assemble the verification message into scratch: modality || subCommand || subCommandParams
-        final short bioMsgLen = (short)(2 + (subCmdParamsIdx == -1 ? 0 : subCmdParamsLen));
-        final short bioMsgHandle = bufferManager.allocate(apdu, bioMsgLen, BufferManager.ANYWHERE);
-        final short bioMsgOff = bufferManager.getOffsetForHandle(bioMsgHandle);
-        final byte[] bioMsgBuf = bufferManager.getBufferForHandle(apdu, bioMsgHandle);
-        bioMsgBuf[bioMsgOff] = modality;
-        bioMsgBuf[(short)(bioMsgOff + 1)] = subCommand;
-        if (subCmdParamsIdx != -1 && subCmdParamsLen > 0) {
-            Util.arrayCopyNonAtomic(reqBuffer, subCmdParamsIdx,
-                    bioMsgBuf, (short)(bioMsgOff + 2), subCmdParamsLen);
-        }
-
-        // Verify. Do NOT invalidate the token: a single enrollment spans enrollBegin + repeated
-        // enrollCaptureNext commands, all sharing the same token.
-        checkPinToken(apdu, bioMsgBuf, bioMsgOff, bioMsgLen,
-                reqBuffer, pinAuthDataIdx, pinProtocol, false);
-        bufferManager.release(apdu, bioMsgHandle, bioMsgLen);
-
-        // Dispatch sub-command
-        switch (subCommand) {
-            case FIDOConstants.BIO_ENROLL_BEGIN:
-                bioEnrollBeginWithSensor(apdu);
-                break;
-            case FIDOConstants.BIO_ENROLL_CAPTURE_NEXT:
-                bioEnrollCaptureNextWithSensor(apdu);
-                break;
-            case FIDOConstants.BIO_ENROLL_CANCEL:
-                bioEnrollActive = false;
-                // Empty success response
-                bufferMem[0] = FIDOConstants.CTAP2_OK;
-                doSendResponse(apdu, (short) 1);
-                break;
-            case FIDOConstants.BIO_ENROLL_ENUMERATE:
-                bioEnumerateEnrollments(apdu);
-                break;
-            case FIDOConstants.BIO_ENROLL_SET_NAME:
-                bioSetFriendlyName(apdu, reqBuffer, subCmdParamsIdx, subCmdParamsLen, lc);
-                break;
-            case FIDOConstants.BIO_ENROLL_REMOVE:
-                bioRemoveEnrollment(apdu, reqBuffer, subCmdParamsIdx, subCmdParamsLen);
-                break;
-            default:
-                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_SUBCOMMAND);
-                break;
-        }
-    }
-
-    /**
-     * Send getModality response
-     */
-    private void bioSendModalityResponse(APDU apdu) {
-        byte[] buffer = bufferMem;
-        short offset = 0;
-
-        buffer[offset++] = FIDOConstants.CTAP2_OK;
-        buffer[offset++] = (byte) 0xA1; // map(1)
-        buffer[offset++] = FIDOConstants.BIO_RESP_MODALITY;
-        buffer[offset++] = FIDOConstants.BIO_MODALITY_FINGERPRINT;
-
-        doSendResponse(apdu, offset);
-    }
-
-    /**
-     * Send getFingerprintSensorInfo response (via MCU sensor query)
-     */
-    private void bioSendSensorInfoResponse(APDU apdu) {
-        byte[] buffer = bufferMem;
-        short offset = 0;
-
-        buffer[offset++] = FIDOConstants.CTAP2_OK;
-        buffer[offset++] = (byte) 0xA3; // map(3)
-
-        // fingerprintKind: touch (0x01)
-        buffer[offset++] = FIDOConstants.BIO_RESP_FINGERPRINT_KIND;
-        buffer[offset++] = FIDOConstants.BIO_FINGERPRINT_KIND_TOUCH;
-
-        // maxCaptureSamplesReqd
-        buffer[offset++] = FIDOConstants.BIO_RESP_MAX_SAMPLES;
-        buffer[offset++] = FIDOConstants.BIO_SAMPLES_REQUIRED;
-
-        // maxTemplateFriendlyName
-        buffer[offset++] = 0x08; // key for maxTemplateFriendlyName
-        buffer[offset++] = (byte) 0x18; // CBOR uint (1-byte follows)
-        buffer[offset++] = FIDOConstants.BIO_MAX_FRIENDLY_NAME_LEN;
-
-        doSendResponse(apdu, offset);
-    }
-
-    /**
-     * enrollBegin: Start enrollment, capture first sample via MCU sensor.
-     *
-     * This method sends sensor control requests to the MCU by returning
-     * SW=0x91F0. The MCU executes the sensor operation and sends back the
-     * result as a new APDU with INS=0xF1. The process() dispatcher detects
-     * INS=0xF1 and stores the result.
-     *
-     * Since JavaCard cannot do multi-round-trip within a single APDU exchange
-     * using ISOException, the enrollment flow works differently:
-     *
-     * Instead of requesting sensor operations inline, the applet returns
-     * SW=0x91F0 with the sensor command in the response body. The MCU intercepts
-     * this, executes the command, and sends the result back as a new APDU.
-     * This process repeats until the applet returns a final SW=0x9000 response.
-     */
-    private void bioEnrollBeginWithSensor(APDU apdu) {
-        // Single-slot: if already enrolled, must remove first
-        if (bioEnrolled) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_KEY_STORE_FULL);
-            return;
-        }
-        // Start enrollment session with fixed page ID
-        bioEnrollActive = true;
-        bioEnrollPageId = 10;
-        bioEnrollTemplateId[0] = (byte)(bioEnrollPageId >> 8);
-        bioEnrollTemplateId[1] = (byte)(bioEnrollPageId & 0xFF);
-        bioEnrollSamplesRemaining = FIDOConstants.BIO_SAMPLES_REQUIRED;
-        bioEnrollSampleIndex = 1;
-
-        // Added by MP: pre-delete the (single) sensor slot before capturing, so a stale template
-        // left in the sensor from a previous applet installation cannot trigger a false duplicate
-        // during SEARCH_DUP. Enrolling into the single slot is an overwrite by design. The delete
-        // result is ignored (the slot may already be empty) — see BIO_PHASE_ENROLL_PREDELETE.
-        bioEnrollPhase = BIO_PHASE_ENROLL_PREDELETE;
-        byte[] apduBuf = apdu.getBuffer();
-        apduBuf[0] = FIDOConstants.SC_BIO_DELETE_TEMPLATE;
-        apduBuf[1] = 0x00;
-        // Data: [start_page_hi] [start_page_lo] [count_hi] [count_lo]
-        apduBuf[2] = (byte)(bioEnrollPageId >> 8);
-        apduBuf[3] = (byte)(bioEnrollPageId & 0xFF);
-        apduBuf[4] = 0x00;
-        apduBuf[5] = 0x01;
-        apdu.setOutgoing();
-        apdu.setOutgoingLength((short) 6);
-        apdu.sendBytes((short) 0, (short) 6);
-        ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-    }
-
-    /**
-     * Handle sensor result APDU from MCU (INS=0xF1).
-     * Dispatches to the appropriate enrollment phase handler based on bioEnrollPhase.
-     *
-     * State machine:
-     *   CAPTURE  → (success) → send GenChar     → phase=GENCHAR
-     *   GENCHAR  → (success) → send Search      → phase=SEARCH_DUP
-     *   SEARCH   → (no dup)  → sample++
-     *              if samples_remaining>0        → send enroll response (more samples)
-     *              if samples_remaining==0       → send RegModel  → phase=REGMODEL
-     *   REGMODEL → (success) → send StoreChar   → phase=STORE
-     *   STORE    → (success) → enrollment done!  → send final response
-     *   DELETE   → (any)     → send delete result
-     */
-    private void handleBioSensorResult(APDU apdu) {
-        byte[] apduBytes = apdu.getBuffer();
-
-        // P1:P2 = sensor operation status word from MCU
-        short sensorSW = Util.getShort(apduBytes, ISO7816.OFFSET_P1);
-        short amtRead = apdu.setIncomingAndReceive();
-        short dataLen = apdu.getIncomingLength();
-
-        switch (bioEnrollPhase) {
-
-            case BIO_PHASE_ENROLL_PREDELETE:
-                // Added by MP: result of the pre-enrollment slot clear. Ignore the status (the slot
-                // may legitimately have been empty) and proceed to capture the first sample.
-                bioEnrollPhase = BIO_PHASE_CAPTURE;
-                apduBytes[0] = FIDOConstants.SC_BIO_GET_ENROLL_IMAGE;
-                apduBytes[1] = 0x00;
-                apdu.setOutgoing();
-                apdu.setOutgoingLength((short) 2);
-                apdu.sendBytes((short) 0, (short) 2);
-                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                break;
-
-            case BIO_PHASE_CAPTURE:
-                // Result of GetEnrollImage
-                if (sensorSW != (short) 0x9000) {
-                    byte status = mapSensorSWToSampleStatus(sensorSW);
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    bioSendEnrollResponse(apdu, status);
-                    return;
-                }
-                // Image captured → request GenChar
-                bioEnrollPhase = BIO_PHASE_GENCHAR;
-                apduBytes[0] = FIDOConstants.SC_BIO_GENERATE_TEMPLATE;
-                apduBytes[1] = bioEnrollSampleIndex; // P2 = buffer_id
-                apdu.setOutgoing();
-                apdu.setOutgoingLength((short) 2);
-                apdu.sendBytes((short) 0, (short) 2);
-                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                break;
-
-            case BIO_PHASE_GENCHAR:
-                // Result of GenChar
-                if (sensorSW != (short) 0x9000) {
-                    byte status = mapSensorSWToSampleStatus(sensorSW);
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    bioSendEnrollResponse(apdu, status);
-                    return;
-                }
-                // GenChar succeeded → duplicate check via Search
-                bioEnrollPhase = BIO_PHASE_SEARCH_DUP;
-                apduBytes[0] = FIDOConstants.SC_BIO_SEARCH_FINGER;
-                apduBytes[1] = 0x00;
-                // Data: [buffer_id] [start_page_hi] [start_page_lo] [page_count_hi] [page_count_lo]
-                apduBytes[2] = bioEnrollSampleIndex;
-                apduBytes[3] = 0x00;
-                apduBytes[4] = 0x0A; // start_page = 10
-                apduBytes[5] = 0x00;
-                apduBytes[6] = 0x0A; // page_count = 10
-                apdu.setOutgoing();
-                apdu.setOutgoingLength((short) 7);
-                apdu.sendBytes((short) 0, (short) 7);
-                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                break;
-
-            case BIO_PHASE_SEARCH_DUP:
-                // Result of Search (duplicate check)
-                // If search found match (sensorSW=0x9000 and data[0]=0x01) → duplicate
-                if (sensorSW == (short) 0x9000 && dataLen >= 1
-                    && apduBytes[apdu.getOffsetCdata()] == 0x01) {
-                    bioEnrollActive = false;
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    bioSendEnrollResponse(apdu, FIDOConstants.BIO_SAMPLE_EXISTS);
-                    return;
-                }
-                // No duplicate → sample captured successfully
-                bioEnrollSampleIndex++;
-                bioEnrollSamplesRemaining--;
-
-                if (bioEnrollSamplesRemaining == 0) {
-                    // All samples captured → merge templates
-                    bioEnrollPhase = BIO_PHASE_REGMODEL;
-                    apduBytes[0] = FIDOConstants.SC_BIO_REG_MODEL;
-                    apduBytes[1] = 0x00;
-                    apdu.setOutgoing();
-                    apdu.setOutgoingLength((short) 2);
-                    apdu.sendBytes((short) 0, (short) 2);
-                    ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                } else {
-                    // More samples needed → return intermediate response
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    bioSendEnrollResponse(apdu, FIDOConstants.BIO_SAMPLE_GOOD);
-                }
-                break;
-
-            case BIO_PHASE_REGMODEL:
-                // Result of RegModel (template merge)
-                if (sensorSW != (short) 0x9000) {
-                    bioEnrollActive = false;
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
-                    return;
-                }
-                // Merge succeeded → store template
-                bioEnrollPhase = BIO_PHASE_STORE;
-                apduBytes[0] = FIDOConstants.SC_BIO_STORE_TEMPLATE;
-                apduBytes[1] = 0x01; // buffer_id = 1
-                apduBytes[2] = (byte)(bioEnrollPageId >> 8);
-                apduBytes[3] = (byte)(bioEnrollPageId & 0xFF);
-                apdu.setOutgoing();
-                apdu.setOutgoingLength((short) 4);
-                apdu.sendBytes((short) 0, (short) 4);
-                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                break;
-
-            case BIO_PHASE_STORE:
-                // Result of StoreChar (template stored to sensor flash)
-                bioEnrollActive = false;
-                bioEnrollPhase = BIO_PHASE_IDLE;
-                if (sensorSW != (short) 0x9000) {
-                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
-                    return;
-                }
-                // Enrollment complete!
-                bioEnrolled = true;
-                bioSendEnrollResponse(apdu, FIDOConstants.BIO_SAMPLE_GOOD);
-                break;
-
-            case BIO_PHASE_DELETE:
-                // Result of DeleteChar
-                bioEnrollPhase = BIO_PHASE_IDLE;
-                if (sensorSW == (short) 0x9000) {
-                    bioEnrolled = false;
-                    bioTemplateFriendlyNameLen = 0;
-                }
-
-                // If this deletion was triggered by authenticatorReset(),
-                // re-dispatch the reset command now that sensor cleanup is done.
-                if (resetPendingAfterBioDelete) {
-                    // bioEnrolled is now false (or sensor failed, proceed anyway)
-                    // Re-enter authenticatorReset which will skip the sensor
-                    // deletion branch and proceed with the main reset transaction.
-                    authenticatorReset(apdu);
-                    return;
-                }
-
-                // Normal (non-reset) deletion: return success
-                bufferMem[0] = FIDOConstants.CTAP2_OK;
-                doSendResponse(apdu, (short) 1);
-                break;
-
-            // ─── UV Verification Phases (biometric user verification) ───
-
-            case BIO_PHASE_UV_CAPTURE:
-                // Result of CaptureImage for UV verification
-                if (sensorSW != (short) 0x9000) {
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    bioUvPendingCmd = 0;
-                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
-                    return;
-                }
-                // Image captured → generate template in buffer 1
-                bioEnrollPhase = BIO_PHASE_UV_GENCHAR;
-                apduBytes[0] = FIDOConstants.SC_BIO_GENERATE_TEMPLATE;
-                apduBytes[1] = 0x01; // buffer_id = 1
-                apdu.setOutgoing();
-                apdu.setOutgoingLength((short) 2);
-                apdu.sendBytes((short) 0, (short) 2);
-                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                break;
-
-            case BIO_PHASE_UV_GENCHAR:
-                // Result of GenChar for UV verification
-                if (sensorSW != (short) 0x9000) {
-                    bioEnrollPhase = BIO_PHASE_IDLE;
-                    bioUvPendingCmd = 0;
-                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
-                    return;
-                }
-                // Template generated → search enrolled templates for match
-                bioEnrollPhase = BIO_PHASE_UV_SEARCH;
-                apduBytes[0] = FIDOConstants.SC_BIO_SEARCH_FINGER;
-                apduBytes[1] = 0x00;
-                // Data: [buffer_id=1] [start_page_hi=0] [start_page_lo=0] [count_hi] [count_lo]
-                apduBytes[2] = 0x01; // buffer_id
-                apduBytes[3] = 0x00;
-                apduBytes[4] = 0x00; // start_page = 0
-                apduBytes[5] = 0x00;
-                apduBytes[6] = (byte) 0x64; // page_count = 100 (search all)
-                apdu.setOutgoing();
-                apdu.setOutgoingLength((short) 7);
-                apdu.sendBytes((short) 0, (short) 7);
-                ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-                break;
-
-            case BIO_PHASE_UV_SEARCH:
-                // Result of Search for UV verification
-                bioEnrollPhase = BIO_PHASE_IDLE;
-                if (sensorSW == (short) 0x9000 && dataLen >= 1
-                    && apduBytes[apdu.getOffsetCdata()] == 0x01) {
-                    // Fingerprint matched — UV verified!
-                    bioUvVerified = true;
-                    bioUvFailCount[0] = 0; // Added by MP: reset UV retry counter on success
-                    byte pendingCmd = bioUvPendingCmd;
-                    short pendingLc = bioUvPendingLc;
-                    bioUvPendingCmd = 0;
-                    bioUvPendingLc = 0;
-
-                    // Clear bufferManager and re-initialize APDU buffer for clean re-entry
-                    bufferManager.clear();
-                    bufferManager.initializeAPDU(apdu);
-                    bufferManager.informAPDUBufferAvailability(apdu, (short) 0xFF);
-
-                    // Re-dispatch the pending command from saved bufferMem data
-                    if (pendingCmd == FIDOConstants.CMD_MAKE_CREDENTIAL) {
-                        makeCredential(apdu, pendingLc, bufferMem);
-                    } else if (pendingCmd == FIDOConstants.CMD_GET_ASSERTION) {
-                        getAssertion(apdu, pendingLc, bufferMem, (short) 0);
-                    } else if (pendingCmd == FIDOConstants.CMD_CLIENT_PIN) {
-                        // Added by MP: re-dispatch getPinUvAuthTokenUsingUvWithPermissions
-                        clientPINSubcommand(apdu, bufferMem, pendingLc);
-                    } else {
-                        bioUvVerified = false;
-                        sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_OTHER);
-                    }
-                } else {
-                    // No match — UV verification failed
-                    byte failedCmd = bioUvPendingCmd; // Added by MP
-                    bioUvPendingCmd = 0;
-                    // Added by MP: count the failure on EVERY path (token and ad-hoc). Previously only the
-                    // clientPIN token path was counted, so fingerprint matching via makeCredential/getAssertion
-                    // could be retried without limit.
-                    if (bioUvFailCount[0] < BIO_UV_MAX_RETRIES) {
-                        bioUvFailCount[0]++;
-                    }
-                    if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
-                        // Retries exhausted for this power cycle, on either path
-                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
-                    } else if (failedCmd == FIDOConstants.CMD_CLIENT_PIN) {
-                        // Standards token flow expects a UV-specific error
-                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_INVALID);
-                    } else {
-                        // Ad-hoc UV path: keep the original error code so existing clients behave the same
-                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
-                    }
-                }
-                return;
-
-            default:
-                // Unknown phase
-                bioEnrollPhase = BIO_PHASE_IDLE;
-                sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_OTHER);
-                break;
-        }
-    }
-
-    /**
-     * Build and send enrollment status response
-     */
-    private void bioSendEnrollResponse(APDU apdu, byte sampleStatus) {
-        byte[] buffer = bufferMem;
-        short offset = 0;
-
-        buffer[offset++] = FIDOConstants.CTAP2_OK;
-
-        // Determine map size: templateId + sampleStatus + remaining
-        byte mapSize = (byte)(bioEnrollActive ? 3 : 2);
-        buffer[offset++] = (byte)(0xA0 | mapSize); // CBOR map
-
-        if (bioEnrollActive) {
-            // templateId (byte string)
-            buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_ID;
-            buffer[offset++] = (byte)(0x40 | 2); // bstr(2)
-            buffer[offset++] = bioEnrollTemplateId[0];
-            buffer[offset++] = bioEnrollTemplateId[1];
-        }
-
-        // lastEnrollSampleStatus
-        buffer[offset++] = FIDOConstants.BIO_RESP_LAST_SAMPLE_STATUS;
-        buffer[offset++] = sampleStatus; // unsigned int
-
-        // remainingSamples
-        buffer[offset++] = FIDOConstants.BIO_RESP_REMAINING_SAMPLES;
-        buffer[offset++] = bioEnrollSamplesRemaining;
-
-        doSendResponse(apdu, offset);
-    }
-
-    /**
-     * captureNextSample: Capture next enrollment sample via MCU sensor.
-     */
-    private void bioEnrollCaptureNextWithSensor(APDU apdu) {
-        if (!bioEnrollActive) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_NOT_ALLOWED);
-            return;
-        }
-
-        bioEnrollPhase = BIO_PHASE_CAPTURE;
-
-        // Request GetEnrollImage from MCU
-        byte[] apduBuf = apdu.getBuffer();
-        apduBuf[0] = FIDOConstants.SC_BIO_GET_ENROLL_IMAGE;
-        apduBuf[1] = 0x00;
-        apdu.setOutgoing();
-        apdu.setOutgoingLength((short) 2);
-        apdu.sendBytes((short) 0, (short) 2);
-        ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-    }
-
-    /**
-     * Enumerate enrolled fingerprints from persistent store.
-     */
-    private void bioEnumerateEnrollments(APDU apdu) {
-        byte[] buffer = bufferMem;
-        short offset = 0;
-
-        buffer[offset++] = FIDOConstants.CTAP2_OK;
-        buffer[offset++] = (byte) 0xA1; // map(1)
-        buffer[offset++] = FIDOConstants.BIO_RESP_TEMPLATE_INFOS;
-
-        if (!bioEnrolled) {
-            buffer[offset++] = (byte) 0x80; // array(0)
-        } else {
-            buffer[offset++] = (byte) 0x81; // array(1) — single slot
-
-            // templateInfo map: templateId + optional friendlyName
-            boolean hasName = bioTemplateFriendlyNameLen > 0;
-            byte mapSize = (byte)(hasName ? 2 : 1);
-            buffer[offset++] = (byte)(0xA0 | mapSize);
-
-            // templateId (subCommandParams key 0x01 per CTAP2.1 spec §6.7)
-            buffer[offset++] = FIDOConstants.BIO_SUBCMD_PARAM_TEMPLATE_ID;
-            buffer[offset++] = (byte)(0x40 | 2); // bstr(2)
-            buffer[offset++] = (byte)(bioEnrollPageId >> 8);
-            buffer[offset++] = (byte)(bioEnrollPageId & 0xFF);
-
-            // templateFriendlyName (subCommandParams key 0x02, optional)
-            if (hasName) {
-                buffer[offset++] = FIDOConstants.BIO_SUBCMD_PARAM_FRIENDLY_NAME;
-                if (bioTemplateFriendlyNameLen <= 23) {
-                    buffer[offset++] = (byte)(0x60 | bioTemplateFriendlyNameLen); // tstr(n)
-                } else {
-                    buffer[offset++] = 0x78; // tstr, 1-byte length follows
-                    buffer[offset++] = (byte) bioTemplateFriendlyNameLen;
-                }
-                Util.arrayCopy(bioTemplateFriendlyName, (short) 0, buffer, offset, bioTemplateFriendlyNameLen);
-                offset += bioTemplateFriendlyNameLen;
-            }
-        }
-
-        doSendResponse(apdu, offset);
-    }
-
-    /**
-     * Store friendly name for an enrolled fingerprint template.
-     * Parses subCommandParams CBOR map to extract templateId and templateFriendlyName,
-     * then persists the name (similar to bio_set_friendly_name in firmware ctap_bio_enrollment.c).
-     */
-    private void bioSetFriendlyName(APDU apdu, byte[] reqBuffer, short paramsIdx, short paramsLen, short lc) {
-        if (paramsIdx < 0 || paramsLen <= 0) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
-            return;
-        }
-        if (!bioEnrolled) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_NO_FINGERPRINTS);
-            return;
-        }
-
-        // Parse subCommandParams CBOR map
-        short readIdx = paramsIdx;
-        short endIdx = (short)(paramsIdx + paramsLen);
-
-        byte mapCount = (byte) getMapEntryCount(apdu, reqBuffer[readIdx]);
-        readIdx++;
-
-        short nameIdx = -1;
-        short nameLen = 0;
-        boolean hasTemplateId = false;
-
-        for (short i = 0; i < mapCount && readIdx < endIdx; i++) {
-            byte key = reqBuffer[readIdx++];
-
-            switch (key) {
-                case FIDOConstants.BIO_SUBCMD_PARAM_TEMPLATE_ID: // 0x01
-                    hasTemplateId = true;
-                    readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                    break;
-                case FIDOConstants.BIO_SUBCMD_PARAM_FRIENDLY_NAME: { // 0x02
-                    // Parse CBOR text string (major type 3)
-                    short s = ub(reqBuffer[readIdx]);
-                    if (s >= 0x0060 && s <= 0x0077) {
-                        // Short text string: length 0-23
-                        nameLen = (short)(s - 0x0060);
-                        readIdx++;
-                        nameIdx = readIdx;
-                        readIdx += nameLen;
-                    } else if (s == 0x0078) {
-                        // Text string with 1-byte length
-                        readIdx++;
-                        nameLen = ub(reqBuffer[readIdx]);
-                        readIdx++;
-                        nameIdx = readIdx;
-                        readIdx += nameLen;
-                    } else {
-                        // Unsupported encoding or byte string — skip
-                        readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                    }
-                    break;
-                }
-                default:
-                    readIdx = consumeAnyEntity(apdu, reqBuffer, readIdx, lc);
-                    break;
-            }
-        }
-
-        if (!hasTemplateId) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
-            return;
-        }
-
-        if (nameIdx >= 0 && nameLen > 0 && nameLen <= FIDOConstants.BIO_MAX_FRIENDLY_NAME_LEN) {
-            Util.arrayCopy(reqBuffer, nameIdx, bioTemplateFriendlyName, (short) 0, nameLen);
-            bioTemplateFriendlyNameLen = nameLen;
-        } else if (nameLen == 0) {
-            // Empty name clears the friendly name
-            bioTemplateFriendlyNameLen = 0;
-        } else {
-            sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_INVALID_PARAMETER);
-            return;
-        }
-
-        bufferMem[0] = FIDOConstants.CTAP2_OK;
-        doSendResponse(apdu, (short) 1);
-    }
-
-    /**
-     * Remove enrolled fingerprint by sending delete command to MCU sensor.
-     */
-    private void bioRemoveEnrollment(APDU apdu, byte[] reqBuffer, short paramsIdx, short paramsLen) {
-        if (!bioEnrolled) {
-            // Nothing to remove
-            bufferMem[0] = FIDOConstants.CTAP2_OK;
-            doSendResponse(apdu, (short) 1);
-            return;
-        }
-
-        bioEnrollPhase = BIO_PHASE_DELETE;
-
-        byte[] apduBuf = apdu.getBuffer();
-        apduBuf[0] = FIDOConstants.SC_BIO_DELETE_TEMPLATE;
-        apduBuf[1] = 0x00;
-        // Data: [start_page_hi] [start_page_lo] [count_hi] [count_lo]
-        apduBuf[2] = (byte)(bioEnrollPageId >> 8);
-        apduBuf[3] = (byte)(bioEnrollPageId & 0xFF);
-        apduBuf[4] = 0x00;
-        apduBuf[5] = 0x01;
-        apdu.setOutgoing();
-        apdu.setOutgoingLength((short) 6);
-        apdu.sendBytes((short) 0, (short) 6);
-        ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-    }
-
-    /**
-     * Map MCU sensor SW to CTAP2 bio enrollment sample status
-     */
-    private byte mapSensorSWToSampleStatus(short sw) {
-        switch (sw) {
-            case (short) 0x9000: return FIDOConstants.BIO_SAMPLE_GOOD;
-            case (short) 0x6F02: return FIDOConstants.BIO_SAMPLE_NO_USER_ACTIVITY;
-            case (short) 0x6F03: return FIDOConstants.BIO_SAMPLE_POOR_QUALITY;
-            case (short) 0x6F04: return FIDOConstants.BIO_SAMPLE_EXISTS;
-            case (short) 0x6F05: return FIDOConstants.BIO_SAMPLE_NO_USER_PRESENCE_TRANSITION;
-            case (short) 0x6F07: return FIDOConstants.BIO_SAMPLE_POOR_QUALITY;
-            default:             return FIDOConstants.BIO_SAMPLE_POOR_QUALITY;
-        }
-    }
 
     /**
      * Handles an authenticator config CTAP2.1 subcommand
@@ -6365,7 +5475,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      *
      * @param apdu Request/response object
      */
-    private void authenticatorReset(APDU apdu) {
+    void authenticatorReset(APDU apdu) {
         if (PROTECT_AGAINST_MALICIOUS_RESETS) {
             if (transientStorage.isResetCommandSentSincePowerOn()) {
                 // Already tried to reset once since power applied, and the protection feature is enabled.
@@ -6385,26 +5495,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         // before proceeding with the reset transaction. The sensor control
         // protocol (SW=0x91F0) interrupts APDU flow, so this must happen
         // outside the JCSystem transaction below.
-        if (bioEnrolled && !resetPendingAfterBioDelete) {
-            resetPendingAfterBioDelete = true;
-            bioEnrollPhase = BIO_PHASE_DELETE;
-
-            byte[] apduBuf = apdu.getBuffer();
-            apduBuf[0] = FIDOConstants.SC_BIO_DELETE_TEMPLATE;
-            apduBuf[1] = 0x00;
-            // Data: [start_page_hi] [start_page_lo] [count_hi] [count_lo]
-            apduBuf[2] = (byte)(bioEnrollPageId >> 8);
-            apduBuf[3] = (byte)(bioEnrollPageId & 0xFF);
-            apduBuf[4] = 0x00;
-            apduBuf[5] = 0x01; // count = 1
-            apdu.setOutgoing();
-            apdu.setOutgoingLength((short) 6);
-            apdu.sendBytes((short) 0, (short) 6);
-            ISOException.throwIt(FIDOConstants.SW_BIO_SENSOR_CONTROL);
-            return; // unreachable, but makes intent clear
-        }
-        // Clear the flag in case we re-entered after sensor deletion
-        resetPendingAfterBioDelete = false;
+        bioManager.prepareForReset(apdu);
 
         final short pinIdx = pinRetryCounter.prepareIndex();
         final byte tempBlobStoreIndex = (byte)(largeBlobStoreIndex == 0 ? 1 : 0);
@@ -6447,9 +5538,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             numResidentRPs = 0;
 
             pinSet = false;
-            bioEnrolled = false;
-            bioEnrollPageId = 10;
-            bioTemplateFriendlyNameLen = 0;
+            bioManager.onFactoryReset(); // Added by MP
             if (STORE_PIN_LENGTH) {
                 pinCodePointLength = 0;
             }
@@ -6519,7 +5608,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      */
     private void sendAuthInfo(APDU apdu) {
-        // bioEnrolled is now maintained by persistent enrollment store
+        // enrollment state is owned by BioManager
         // No sensor probe needed — trust addBioEnrollment/removeBioEnrollment
 
         // Write entire response to bufferMem, then use doSendResponse which
@@ -6564,7 +5653,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         // Added by MP: report uv=true only when a fingerprint template is enrolled (configured),
         // uv=false when the sensor is present but not configured. This lets platforms (e.g. Windows)
         // correctly fall back to PIN instead of attempting built-in UV that cannot succeed.
-        buffer[offset++] = (byte)(bioEnrolled ? 0xF5 : 0xF4); // uv
+        buffer[offset++] = (byte)(bioManager.isEnrolled() ? 0xF5 : 0xF4); // uv
 
         offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_SECOND_B, (short) 0,
                 buffer, offset, (short) CannedCBOR.AUTH_INFO_SECOND_B.length);
@@ -6574,7 +5663,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         offset = Util.arrayCopyNonAtomic(CannedCBOR.AUTH_INFO_THIRD, (short) 0,
                 buffer, offset, (short) CannedCBOR.AUTH_INFO_THIRD.length);
 
-        buffer[offset++] = (byte)(bioEnrolled ? 0xF5 : 0xF4); // bioEnroll: true if templates enrolled
+        buffer[offset++] = (byte)(bioManager.isEnrolled() ? 0xF5 : 0xF4); // bioEnroll: true if templates enrolled
 
         offset = encodeIntLenTo(buffer, offset, (short) CannedCBOR.CLIENT_PIN.length, false);
         offset = Util.arrayCopyNonAtomic(CannedCBOR.CLIENT_PIN, (short) 0,
@@ -6705,7 +5794,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param buffer  Buffer containing incoming request
      * @param lc      Length of incoming request, as sent by the platform
      */
-    private void clientPINSubcommand(APDU apdu, byte[] buffer, short lc) {
+    void clientPINSubcommand(APDU apdu, byte[] buffer, short lc) {
         short readIdx = 1;
 
         if (lc == 0) {
@@ -6772,11 +5861,11 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      *
      * Since the fingerprint capture is a multi-round-trip sensor exchange, this runs in two phases,
      * reusing the existing bio-UV pending/re-dispatch machinery:
-     *   Phase 1 (bioUvVerified == false): validate preconditions and start fingerprint verification.
+     *   Phase 1 (bioManager.isUvVerified() == false): validate preconditions and start fingerprint verification.
      *            The key agreement is deliberately NOT consumed here, because consumeKeyAgreement()
      *            mangles the request buffer; leaving it intact lets bufferMem survive the sensor
      *            round-trips so the command can be re-dispatched.
-     *   Phase 2 (bioUvVerified == true): fingerprint matched — derive the shared secret, apply the
+     *   Phase 2 (bioManager.isUvVerified() == true): fingerprint matched — derive the shared secret, apply the
      *            requested permissions/rpId, and return the encrypted pinUvAuthToken.
      *
      * @param apdu        Request/response object
@@ -6788,25 +5877,21 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      */
     private void handleClientPinGetTokenUsingUv(APDU apdu, byte[] buffer, short readIdx, short lc,
                                                 byte pinProtocol, short numOptions) {
-        if (!bioEnrolled) {
+        if (!bioManager.isEnrolled()) {
             // Built-in UV is not configured — platform should have used the PIN instead
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
         }
-        if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
-        }
 
-        if (!bioUvVerified) {
-            // Phase 1: kick off fingerprint verification (leaves the request buffer untouched)
-            bioUvPendingCmd = FIDOConstants.CMD_CLIENT_PIN;
-            bioUvPendingLc = lc;
-            startBioUvVerification(apdu);
-            // ISOException thrown by startBioUvVerification — never reached
+        if (!bioManager.isUvVerified()) {
+            // Phase 1: kick off fingerprint verification (leaves the request buffer untouched).
+            // startUvFor also rejects the request with UV_BLOCKED if the retry limit is exhausted.
+            bioManager.startUvFor(apdu, FIDOConstants.CMD_CLIENT_PIN, lc);
+            // never reached
             return;
         }
 
-        // Phase 2: fingerprint already matched (re-dispatched from handleBioSensorResult)
-        bioUvVerified = false; // consume the one-shot verification flag
+        // Phase 2: fingerprint already matched (re-dispatched from the sensor state machine)
+        bioManager.consumeUvVerified(); // consume the one-shot verification flag
 
         if (buffer[readIdx++] != 0x03) { // map key: keyAgreement
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
@@ -6904,7 +5989,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         outBuf[outputLen++] = FIDOConstants.CTAP2_OK;
         outBuf[outputLen++] = (byte) 0xA1; // map - one entry
         outBuf[outputLen++] = 0x05; // map key: uvRetries
-        short remaining = (short)(BIO_UV_MAX_RETRIES - bioUvFailCount[0]);
+        short remaining = bioManager.getUvRetriesRemaining();
         if (remaining < 0) {
             remaining = 0;
         }
@@ -7843,9 +6928,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         // Added by MP: clear any stale biometric-UV verification state between card sessions.
         // The multi-round-trip fingerprint flow always completes within a single session, so this
         // only ever discards leftover state and never interrupts an in-progress verification.
-        bioUvVerified = false;
-        bioUvPendingCmd = 0;
-        bioUvPendingLc = 0;
+        bioManager.resetTransientState();
     }
 
     /**
@@ -8116,7 +7199,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         initAuthenticatorKey(authenticatorKeyInRam);
         initCredKey(ecPairInRam);
-        initBioEnrollment();
+        bioManager = new BioManager(this);
     }
 
     /**
