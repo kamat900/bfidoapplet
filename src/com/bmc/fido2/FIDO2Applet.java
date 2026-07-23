@@ -843,6 +843,12 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         if (!pinAuthSuccess) {
             // Try biometric UV when fingerprints are enrolled (regardless of alwaysUv/pinSet)
             if (bioEnrolled && !bioUvVerified) {
+                // Added by MP: enforce the UV retry limit on this ad-hoc path too. Without this, only the
+                // standards token path (clientPIN 0x06) was rate-limited, leaving fingerprint matching here
+                // open to unlimited attempts. Returning UV_BLOCKED tells the client to fall back to the PIN.
+                if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
+                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
+                }
                 bioUvPendingCmd = FIDOConstants.CMD_MAKE_CREDENTIAL;
                 bioUvPendingLc = lc;
                 startBioUvVerification(apdu);
@@ -2162,6 +2168,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 // extra sensor round-trip that desynced the bio state machine and made the following
                 // real (token-bearing) getAssertion fail with 0x7F.
                 if (bioEnrolled && !bioUvVerified && transientStorage.hasUPOption()) {
+                    // Added by MP: enforce the UV retry limit on this ad-hoc path too (see makeCredential).
+                    if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
+                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
+                    }
                     bioUvPendingCmd = FIDOConstants.CMD_GET_ASSERTION;
                     bioUvPendingLc = lc;
                     startBioUvVerification(apdu);
@@ -4423,6 +4433,19 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         bufferManager.clear();
 
+        // Added by MP: reset biometric state on every applet SELECT.
+        // These fields are persistent (EEPROM), so a power loss ("tear") in the middle of a fingerprint
+        // flow would otherwise leave them stale. Most importantly bioUvVerified could survive as `true`
+        // and make the NEXT makeCredential/getAssertion skip the fingerprint entirely — a UV bypass.
+        // A tear is always followed by a power-up + SELECT, so clearing here closes that window.
+        // Safe for in-progress work: the multi-round 0x91F0 sensor loop never re-SELECTs mid-flow, and a
+        // multi-command enrollment only spans commands within one already-selected session.
+        bioUvVerified = false;
+        bioUvPendingCmd = 0;
+        bioUvPendingLc = 0;
+        bioEnrollPhase = BIO_PHASE_IDLE;
+        bioEnrollActive = false;
+
         // For U2F compatibility, the CTAP2 standard requires that we respond to select() as if we were a U2F
         // authenticator, and then let the platform figure out we're really CTAP2 by making a getAuthenticatorInfo
         // API request afterwards
@@ -5055,18 +5078,20 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                     // No match — UV verification failed
                     byte failedCmd = bioUvPendingCmd; // Added by MP
                     bioUvPendingCmd = 0;
-                    if (failedCmd == FIDOConstants.CMD_CLIENT_PIN) {
-                        // Added by MP: standard UV token flow — track retries and report UV errors
-                        if (bioUvFailCount[0] < BIO_UV_MAX_RETRIES) {
-                            bioUvFailCount[0]++;
-                        }
-                        if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
-                            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
-                        } else {
-                            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_INVALID);
-                        }
+                    // Added by MP: count the failure on EVERY path (token and ad-hoc). Previously only the
+                    // clientPIN token path was counted, so fingerprint matching via makeCredential/getAssertion
+                    // could be retried without limit.
+                    if (bioUvFailCount[0] < BIO_UV_MAX_RETRIES) {
+                        bioUvFailCount[0]++;
+                    }
+                    if (bioUvFailCount[0] >= BIO_UV_MAX_RETRIES) {
+                        // Retries exhausted for this power cycle, on either path
+                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_BLOCKED);
+                    } else if (failedCmd == FIDOConstants.CMD_CLIENT_PIN) {
+                        // Standards token flow expects a UV-specific error
+                        sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UV_INVALID);
                     } else {
-                        // Existing ad-hoc UV path (makeCredential/getAssertion): unchanged behavior
+                        // Ad-hoc UV path: keep the original error code so existing clients behave the same
                         sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_OPERATION_DENIED);
                     }
                 }
