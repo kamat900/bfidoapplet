@@ -2155,8 +2155,13 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             byte pinProtocol = transientStorage.getPinProtocolInUse();
 
             if (!pinProvided) {
-                // Try biometric UV when fingerprints are enrolled (regardless of alwaysUv)
-                if (bioEnrolled && !bioUvVerified) {
+                // Try biometric UV when fingerprints are enrolled (regardless of alwaysUv).
+                // Added by MP: only when user presence is actually requested. A getAssertion with
+                // up=false is a SILENT credential-probe (libfido2/pam-u2f pre-flight) that per CTAP2.1
+                // must not prompt for presence/verification. Triggering fingerprint there caused an
+                // extra sensor round-trip that desynced the bio state machine and made the following
+                // real (token-bearing) getAssertion fail with 0x7F.
+                if (bioEnrolled && !bioUvVerified && transientStorage.hasUPOption()) {
                     bioUvPendingCmd = FIDOConstants.CMD_GET_ASSERTION;
                     bioUvPendingLc = lc;
                     startBioUvVerification(apdu);
@@ -2957,7 +2962,14 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
         boolean matches = false;
 
-        if (potentiallyTryHighSecKey) {
+        // Added by MP: only attempt the high-security wrapping key if it is actually loaded.
+        // A pinUvAuthToken obtained via built-in UV (fingerprint) does NOT unlock the high-security
+        // wrapping key (that key is derived from the PIN). Previously, a UV-token getAssertion set
+        // maximumCredProtectLevel=3 and called extractCredentialMixed() with an UNINITIALIZED AESKey,
+        // throwing a CryptoException that surfaced to the host (via the MCU bridge) as CTAP 0x7F.
+        // Guarding here lets low-security credentials fall through to the low-security key; genuinely
+        // high-security credentials simply won't match under UV-only auth (correct — they need the PIN).
+        if (potentiallyTryHighSecKey && highSecurityWrappingKey.isInitialized()) {
             final byte gottenCredProtLevelMixed = extractCredentialMixed(credentialBuffer, credentialOffset,
                     outputBuffer, outputOffset,
                     highSecurityWrappingKey);
