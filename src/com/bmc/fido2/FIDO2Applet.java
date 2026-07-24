@@ -401,12 +401,24 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     private short largeBlobStoreFill;
 
     /**
-     * Unique identifier ID - set on loading an attestation,
-     * certificate, or left zeroes for self-attestation.
+     * Authenticator Attestation GUID - identifies this authenticator MODEL (not the vendor, and never an
+     * individual device: per FIDO, one AAGUID must cover a large batch, otherwise it becomes a per-user
+     * tracking identifier).
+     *
+     * Added by MP: hard-coded to the BMC S-USB AIO model AAGUID ce139917-fa51-4eac-8b9f-406ad7705a95, so
+     * every unit self-identifies as this model out of the box and can be allow-listed by fleet policy
+     * (e.g. Microsoft Entra ID key restrictions) without running the attestation-certificate installer.
+     *
+     * Upstream left this all-zeroes because a meaningful AAGUID is conventionally paired with verifiable
+     * (batch) attestation, and this applet self-attests until an attestation key/certificate is loaded.
+     * Relying parties that ENFORCE attestation will still reject registration until a real batch
+     * certificate is installed - loading one via CMD_INSTALL_CERTS overwrites the value below.
+     *
+     * Mint a new AAGUID only for a new model or a significant change in characteristics.
      */
     private final byte[] aaguid = {
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            (byte) 0xCE, 0x13, (byte) 0x99, 0x17, (byte) 0xFA, 0x51, 0x4E, (byte) 0xAC,
+            (byte) 0x8B, (byte) 0x9F, 0x40, 0x6A, (byte) 0xD7, 0x70, 0x5A, (byte) 0x95
     };
 
     /**
@@ -3555,7 +3567,14 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 // Stream cert install, which can be very large, directly
                 boolean done = false;
                 if (attestationData == null) {
-                    // Initial attestation data
+                    // Initial attestation data.
+                    // NOTE (MP): the offset here is 6, NOT 1 - do not "simplify" it. The APDU data is
+                    //   [0x46 command byte] + [5-byte CBOR map header "A1 01 59 <len16>"] + raw params
+                    // so the raw params (aaguid || private key || cert chain) start at bufferMem[6].
+                    // For a short APDU getOffsetCdata() is 5, so getOffsetCdata()+1 == 6. The continuation
+                    // path below uses offset 1 because follow-up blocks carry raw payload with no CBOR
+                    // header - only this first block has one. The non-chained dispatch makes the same
+                    // 5-byte-header assumption (lcEffective = lc - 5).
                     final short apOffset = (short)(apdu.getOffsetCdata() + 1);
                     final short lcEffective = (short)(lc - apOffset);
                     done = initAttestationKeyStart(apdu, bufferMem,
@@ -7018,7 +7037,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
     private FIDO2Applet(byte[] array, short offset, byte length) {
         // set up parameters
         // first, defaults
-        attestationSwitchingEnabled = false;
+        attestationSwitchingEnabled = true;
         LOW_SECURITY_MAXIMUM_COMPLIANCE = true;
         FORCE_ALWAYS_UV = false;
         USE_LOW_SECURITY_FOR_SOME_RKS = true;
